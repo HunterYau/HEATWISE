@@ -1,0 +1,343 @@
+schema_version: "1.0"
+predictor_set_version: "1.0.0"
+target_column: calculated_utci_c
+
+# Exact operational columns allowed for the preregistered primary model. Every feature
+# must be available at an unsensed location. Lags and summaries refer only to operational
+# background products, never to the local label sensor.
+core_predictors: &core_predictors
+  - background_air_temperature_c
+  - background_dew_point_c
+  - background_relative_humidity_pct
+  - background_wind_speed_m_s
+  - background_surface_pressure_pa
+  - background_cloud_cover_pct
+  - background_shortwave_radiation_w_m2
+  - background_precipitation_1h_mm
+  - background_precipitation_3h_mm
+  - background_weather_source_distance_m
+  - background_weather_age_minutes
+  - background_air_temperature_lag_1h_c
+  - background_air_temperature_lag_3h_c
+  - background_air_temperature_lag_24h_c
+  - background_temperature_heating_rate_c_per_h
+  - background_cumulative_hot_hours_24h
+  - ndvi
+  - ndbi
+  - ndwi
+  - albedo_proxy
+  - land_cover_class
+  - impervious_fraction
+  - canopy_fraction
+  - grass_fraction
+  - water_fraction
+  - elevation_m
+  - slope_degrees
+  - aspect_sin
+  - aspect_cos
+  - distance_to_coast_m
+  - building_fraction
+  - road_fraction
+  - distance_to_major_road_m
+  - sky_view_factor
+  - estimated_shade_fraction
+  - solar_elevation_degrees
+  - solar_azimuth_sin
+  - solar_azimuth_cos
+  - hour_sin
+  - hour_cos
+  - day_of_year_sin
+  - day_of_year_cos
+  - canopy_fraction_15m
+  - impervious_fraction_15m
+  - grass_fraction_15m
+  - water_fraction_15m
+  - building_fraction_15m
+  - road_fraction_15m
+  - mean_building_height_m_15m
+  - sky_view_factor_15m
+  - ndvi_mean_15m
+  - albedo_mean_15m
+  - canopy_to_impervious_ratio_15m
+  - canopy_fraction_30m
+  - impervious_fraction_30m
+  - grass_fraction_30m
+  - water_fraction_30m
+  - building_fraction_30m
+  - road_fraction_30m
+  - mean_building_height_m_30m
+  - sky_view_factor_30m
+  - ndvi_mean_30m
+  - albedo_mean_30m
+  - canopy_to_impervious_ratio_30m
+  - canopy_fraction_60m
+  - impervious_fraction_60m
+  - grass_fraction_60m
+  - water_fraction_60m
+  - building_fraction_60m
+  - road_fraction_60m
+  - mean_building_height_m_60m
+  - sky_view_factor_60m
+  - ndvi_mean_60m
+  - albedo_mean_60m
+  - canopy_to_impervious_ratio_60m
+  - canopy_fraction_90m
+  - impervious_fraction_90m
+  - grass_fraction_90m
+  - water_fraction_90m
+  - building_fraction_90m
+  - road_fraction_90m
+  - mean_building_height_m_90m
+  - sky_view_factor_90m
+  - ndvi_mean_90m
+  - albedo_mean_90m
+  - canopy_to_impervious_ratio_90m
+  - solar_elevation_x_shortwave
+  - shortwave_x_shade_fraction
+  - shortwave_x_canopy_fraction
+  - background_wind_x_sky_view_factor
+  - background_wind_x_building_fraction
+  - distance_to_coast_x_background_wind
+
+# Thermal imagery is optional and never enters the core set. The enhanced allow-list is
+# exactly the union of core_predictors and these additions, after eligibility checks.
+satellite_enhanced_additions: &satellite_enhanced_additions
+  - satellite_lst_c
+  - satellite_lst_minus_background_air_temperature_c
+  - satellite_image_age_hours
+  - satellite_overpass_hour_sin
+  - satellite_overpass_hour_cos
+  - satellite_lst_quality_score
+  - satellite_cloud_fraction
+  - satellite_valid_pixel_fraction
+  - satellite_view_zenith_degrees
+  - satellite_lst_missing
+  - satellite_thermal_source
+  - satellite_lst_quality_flag
+
+permitted_predictor_sets:
+  core: *core_predictors
+  satellite_enhanced:
+    base: core
+    additions: *satellite_enhanced_additions
+
+categorical_features:
+  core:
+    - land_cover_class
+  satellite_enhanced:
+    - land_cover_class
+    - satellite_thermal_source
+    - satellite_lst_quality_flag
+
+missingness_indicators:
+  policy: all_numeric_predictors_with_missing_values_in_training_partition
+  suffix: __missing
+  fit_on_training_only: true
+  satellite_declared_indicator: satellite_lst_missing
+
+buffer_radii_m: [15, 30, 60, 90]
+buffer_feature_families:
+  - canopy_fraction
+  - impervious_fraction
+  - grass_fraction
+  - water_fraction
+  - building_fraction
+  - road_fraction
+  - mean_building_height_m
+  - sky_view_factor
+  - ndvi_mean
+  - albedo_mean
+  - canopy_to_impervious_ratio
+
+interactions:
+  prespecified:
+    - name: solar_elevation_x_shortwave
+      operation: multiply
+      inputs: [solar_elevation_degrees, background_shortwave_radiation_w_m2]
+    - name: shortwave_x_shade_fraction
+      operation: multiply
+      inputs: [background_shortwave_radiation_w_m2, estimated_shade_fraction]
+    - name: shortwave_x_canopy_fraction
+      operation: multiply
+      inputs: [background_shortwave_radiation_w_m2, canopy_fraction]
+    - name: background_wind_x_sky_view_factor
+      operation: multiply
+      inputs: [background_wind_speed_m_s, sky_view_factor]
+    - name: background_wind_x_building_fraction
+      operation: multiply
+      inputs: [background_wind_speed_m_s, building_fraction]
+    - name: distance_to_coast_x_background_wind
+      operation: multiply
+      inputs: [distance_to_coast_m, background_wind_speed_m_s]
+  derive_before_split: false
+  fit_parameters: false
+
+satellite_features:
+  thermal_value: satellite_lst_c
+  source: satellite_thermal_source
+  allowed_sources: [landsat, ecostress]
+  age: satellite_image_age_hours
+  overpass_cyclic: [satellite_overpass_hour_sin, satellite_overpass_hour_cos]
+  quality:
+    - satellite_lst_quality_score
+    - satellite_cloud_fraction
+    - satellite_valid_pixel_fraction
+    - satellite_view_zenith_degrees
+    - satellite_lst_quality_flag
+  missingness: satellite_lst_missing
+
+derived_feature_contracts:
+  background_air_temperature_lags:
+    columns:
+      - background_air_temperature_lag_1h_c
+      - background_air_temperature_lag_3h_c
+      - background_air_temperature_lag_24h_c
+    source_restriction: operational_background_weather_only
+  recent_heating:
+    columns:
+      - background_temperature_heating_rate_c_per_h
+      - background_cumulative_hot_hours_24h
+    source_restriction: operational_background_weather_only
+  cyclic_time:
+    columns: [hour_sin, hour_cos, day_of_year_sin, day_of_year_cos]
+    source: documented_local_civil_hour_and_local_date
+    raw_timestamp_must_be_dropped: true
+  aspect:
+    columns: [aspect_sin, aspect_cos]
+    raw_aspect_degrees_must_be_dropped: true
+  ratios:
+    denominator_epsilon: 1.0e-6
+    zero_denominator_policy: nan_with_missingness_indicator
+
+metadata_columns:
+  - sample_id
+  - site_id
+  - date
+  - timestamp_utc
+  - latitude
+  - longitude
+  - spatial_block_id
+  - weather_event_id
+  - sensor_id
+  - measurement_height_m
+  - calibration_version
+  - quality_flag
+  - split_role
+
+label_and_sensor_columns: &label_and_sensor_columns
+  - measured_air_temperature_c
+  - measured_relative_humidity_pct
+  - measured_pedestrian_wind_speed_m_s
+  - measured_globe_temperature_c
+  - calculated_mrt_c
+  - calculated_mean_radiant_temperature_c
+  - calculated_utci_c
+  - utci_category
+  - optional_wbgt_c
+  - wbgt_c
+  - label_uncertainty_c
+  - measured_vapor_pressure_kpa
+  - local_minus_background_air_temperature_c
+  - local_vapor_pressure_kpa
+  - pedestrian_wind_log_adjustment
+  - mrt_minus_local_air_temperature_c
+
+sensor_label_columns: *label_and_sensor_columns
+
+# The exact deny-list is checked before every model fit and prediction transform. Some
+# entries are harmless metadata but are forbidden because they identify sites, sensors,
+# split membership, or labels and could enable memorization or leakage.
+banned_exact: &banned_exact
+  - sample_id
+  - site_id
+  - date
+  - timestamp_utc
+  - latitude
+  - longitude
+  - spatial_block_id
+  - weather_event_id
+  - sensor_id
+  - measurement_height_m
+  - calibration_version
+  - quality_flag
+  - split_role
+  - fold
+  - outer_fold
+  - inner_fold
+  - measured_air_temperature_c
+  - measured_relative_humidity_pct
+  - measured_pedestrian_wind_speed_m_s
+  - measured_globe_temperature_c
+  - calculated_mrt_c
+  - calculated_mean_radiant_temperature_c
+  - calculated_utci_c
+  - utci_category
+  - optional_wbgt_c
+  - wbgt_c
+  - label_uncertainty_c
+  - measured_vapor_pressure_kpa
+  - local_minus_background_air_temperature_c
+  - local_vapor_pressure_kpa
+  - pedestrian_wind_log_adjustment
+  - mrt_minus_local_air_temperature_c
+  - predicted_utci_c
+  - residual_utci_c
+
+prohibited_exact: *banned_exact
+
+prohibited_prefixes:
+  - measured_
+  - calculated_
+  - target_
+  - label_
+  - predicted_
+  - residual_
+  - sensor_
+  - split_
+  - fold_
+
+prohibited_substrings:
+  - utci
+  - wbgt
+  - globe_temperature
+  - radiant_temperature
+  - vapor_pressure_from_measured
+  - local_sensor
+  - calibration
+
+suspicious_patterns:
+  - "(?i)(^|_)(utci|wbgt|mrt)(_|$)"
+  - "(?i)(^|_)(measured|calculated|target|label|prediction|residual)(_|$)"
+  - "(?i)(^|_)(sample|site|sensor|calibration|quality|split|fold)(?:_?id|_?role|_?flag|_?version)?$"
+  - "(?i)(air|rh|wind|globe).*(sensor|measured|observed|local)"
+  - "(?i)(sensor|measured|observed|local).*(air|humidity|rh|wind|globe)"
+
+subgroup_columns:
+  - utci_category
+  - sun_shade_group
+  - land_cover_class
+  - coast_distance_group
+  - time_of_day_group
+
+land_cover_categories:
+  - built_up
+  - tree_canopy
+  - low_vegetation
+  - bare_ground
+  - water
+  - wetland
+  - agriculture
+  - mixed
+  - other
+  - unknown
+
+category_derivation:
+  target: calculated_utci_c
+  output: utci_category
+  train_classifier: false
+  fixed_thresholds_c:
+    no_heat_stress: [-.inf, 26.0]
+    moderate: [26.0, 32.0]
+    strong: [32.0, 38.0]
+    very_strong: [38.0, 46.0]
+    extreme: [46.0, .inf]

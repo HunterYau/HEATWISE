@@ -1,0 +1,423 @@
+schema_version: "1.0"
+
+project:
+  name: urban_heat_risk_ai
+  version: "0.1.0"
+  seed: 20260720
+  deterministic: true
+
+# These paths are declarations only. The CLI creates artifacts_root only after a user
+# supplies real data and explicitly runs a command that writes results.
+paths:
+  features_config: configs/features.yaml
+  artifacts_root: artifacts
+  split_manifest_name: split_manifest.json
+  final_test_lock_name: final_test.lock.json
+  create_directories_only_on_write: true
+
+data:
+  accepted_formats: [csv, parquet]
+  target_column: calculated_utci_c
+  timestamp_column: timestamp_utc
+  local_date_column: date
+  unit_system: SI
+  timestamp_timezone: UTC
+  require_explicit_data_path: true
+  auto_discovery: false
+
+validation:
+  fail_on_error: true
+  modify_source_data: false
+  duplicate_key: sample_id
+  allowed_split_roles: [unassigned, development, calibration, final_test]
+  training_quality_flags: [pass]
+  warn_missing_fraction: 0.20
+  error_missing_fraction: 0.80
+  require_at_least_one_humidity_predictor:
+    - background_dew_point_c
+    - background_relative_humidity_pct
+
+splits:
+  implementation: SpatioTemporalBlockedSplit
+  manifest_version: "1.0"
+  random_seed: 20260720
+  development_role: development
+  calibration_role: calibration
+  final_test_role: final_test
+  outer_folds: 5
+  inner_folds: 4
+  spatial:
+    block_column: spatial_block_id
+    coordinate_columns: [longitude, latitude]
+    source_crs: EPSG:4326
+    projected_crs: EPSG:6933
+    block_size_m: 500.0
+    block_origin_x_m: 0.0
+    block_origin_y_m: 0.0
+    deterministic_floor_indexing: true
+    choose_block_size_by_model_performance: false
+  temporal:
+    date_column: date
+    weather_event_column: weather_event_id
+    hold_out_complete_dates: true
+    hold_out_complete_weather_events_when_present: true
+  embargo:
+    enabled: true
+    remove_train_rows_sharing_validation_spatial_block: true
+    remove_train_rows_sharing_validation_date: true
+    remove_train_rows_sharing_validation_weather_event: true
+  invariants:
+    assert_disjoint_sample_ids: true
+    assert_no_shared_spatial_blocks: true
+    assert_no_shared_dates: true
+    assert_complete_held_out_dates: true
+    assert_roles_disjoint: true
+  calibration:
+    fraction_of_spatial_day_blocks: 0.15
+    grouping_columns: [spatial_block_id, date]
+    complete_groups_only: true
+    unseen_from_development: true
+    touched_only_by_calibrate: true
+  final_test:
+    fraction_of_spatial_day_blocks: 0.15
+    grouping_columns: [spatial_block_id, date]
+    complete_groups_only: true
+    minimum_geographically_separated_sites: 4
+    minimum_complete_hot_dates: 1
+    preferred_complete_hot_dates: 2
+    hot_date_threshold_c: 32.0
+    locked_by_default: true
+
+preprocessing:
+  fit_scope: current_training_partition_only
+  preserve_feature_order: true
+  numerical:
+    xgboost_missing_value: .nan
+    retain_nan_for_xgboost: true
+    add_missingness_indicators: true
+    standardize_for: [linear, neural_network]
+    standardize_for_xgboost: false
+    standardize_for_random_forest: false
+  categorical:
+    encoder: one_hot
+    handle_unknown: ignore
+    sparse_output: false
+    missing_token: __MISSING__
+  leakage_guard:
+    enabled: true
+    fail_on_undeclared_feature: true
+    fail_on_prohibited_feature: true
+    fail_on_suspicious_feature: true
+    raw_coordinates_as_predictors: false
+
+direct_xgb:
+  estimator: xgboost.XGBRegressor
+  predictor_set: core
+  tree_method: hist
+  device: cpu
+  eval_metric: mae
+  n_jobs: -1
+  random_state: 20260720
+  deterministic_histogram: true
+  objective_candidates:
+    - reg:absoluteerror
+    - reg:pseudohubererror
+  early_stopping_rounds: 50
+  early_stopping_scope: inner_validation_fold_only
+  outer_refit:
+    use_all_outer_training_rows: true
+    tree_count_statistic: median
+    minimum_trees: 300
+    maximum_trees: 1500
+    outer_evaluation_controls_early_stopping: false
+
+tuning:
+  engine: optuna
+  sampler: TPESampler
+  pruner: MedianPruner
+  direction: minimize
+  n_trials: 100
+  timeout_seconds: null
+  seed: 20260720
+  primary_metric: grouped_mae
+  grouping_columns: [spatial_block_id, date]
+  secondary_metrics:
+    - high_utci_mae
+  high_utci_threshold_c: 32.0
+  search_space:
+    n_estimators:
+      type: int
+      low: 300
+      high: 1500
+      step: 25
+    max_depth:
+      type: int
+      low: 3
+      high: 8
+    learning_rate:
+      type: float
+      low: 0.01
+      high: 0.10
+      log: true
+    subsample:
+      type: float
+      low: 0.60
+      high: 1.00
+    colsample_bytree:
+      type: float
+      low: 0.60
+      high: 1.00
+    min_child_weight:
+      type: float
+      low: 0.1
+      high: 30.0
+      log: true
+    reg_alpha:
+      type: float
+      low: 1.0e-8
+      high: 10.0
+      log: true
+    reg_lambda:
+      type: float
+      low: 1.0e-3
+      high: 100.0
+      log: true
+    gamma:
+      type: float
+      low: 0.0
+      high: 5.0
+    huber_slope:
+      type: float
+      low: 0.5
+      high: 5.0
+      log: true
+      applies_only_to: reg:pseudohubererror
+
+heat_weighted_experiment:
+  enabled: false
+  may_replace_primary_only_with_explicit_config_change: true
+  keep_primary_unweighted_results: true
+  thresholds_c: [32.0, 38.0, 46.0]
+  weights: [1.0, 1.5, 2.0, 3.0]
+
+components:
+  enabled: true
+  predictor_set: core
+  use_same_split_manifest_as_direct: true
+  use_same_xgb_search_space_as_direct: true
+  compare_on_identical_observations_only: true
+  models:
+    local_air_delta:
+      label_name: local_minus_background_air_temperature_c
+      formula: measured_air_temperature_c - background_air_temperature_c
+    local_vapor_pressure:
+      label_name: local_vapor_pressure_kpa
+      formula: saturation_vapor_pressure(measured_air_temperature_c) * measured_relative_humidity_pct / 100
+    pedestrian_wind_adjustment:
+      label_name: pedestrian_wind_log_adjustment
+      formula: log1p(measured_pedestrian_wind_speed_m_s) - log1p(background_wind_speed_m_s)
+    mrt_delta:
+      label_name: mrt_minus_local_air_temperature_c
+      formula: calculated_mrt_c - measured_air_temperature_c
+  reconstruction:
+    retain_raw_predictions: true
+    emit_physical_validity_flags: true
+    local_air_temperature_range_c: [-50.0, 65.0]
+    relative_humidity_range_pct: [0.0, 100.0]
+    pedestrian_wind_range_m_s: [0.0, 40.0]
+    mrt_range_c: [-70.0, 120.0]
+    invalid_value_policy: flag_and_return_nan
+  disagreement_warning:
+    learn_from: development_out_of_fold_predictions
+    statistic: absolute_difference_quantile
+    quantile: 0.95
+    never_average_direct_and_component: true
+
+wind_profile:
+  enabled: true
+  method: neutral_logarithmic_profile
+  formula: u_target = u_measurement * log((z_target-d)/z0) / log((z_measurement-d)/z0)
+  source_height_column: measurement_height_m
+  target_height_m: 10.0
+  roughness_length_m: 0.10
+  displacement_height_m: 0.0
+  applicability:
+    minimum_source_height_m: 0.10
+    maximum_source_height_m: 10.0
+    require_source_height_above_roughness_and_displacement: true
+    assume_neutral_stability: true
+    reject_nonpositive_wind: false
+    invalid_value_policy: flag_and_return_nan
+  roughness_sensitivity_values_m: [0.03, 0.10, 0.30, 0.50, 1.00]
+
+utci:
+  implementation: pythermalcomfort.models.utci
+  units: SI
+  round_output: false
+  pythermalcomfort_limit_inputs: false
+  explicit_applicability_limits:
+    air_temperature_c: [-50.0, 50.0]
+    mrt_minus_air_temperature_c: [-30.0, 70.0]
+    wind_10m_m_s: [0.5, 17.0]
+    relative_humidity_pct: [0.0, 100.0]
+  out_of_range_policy: flag_and_return_nan
+  categories:
+    labels: [no_heat_stress, moderate, strong, very_strong, extreme]
+    lower_bounds_c: [-.inf, 26.0, 32.0, 38.0, 46.0]
+
+satellite:
+  predictor_set: satellite_enhanced
+  train_separate_model: true
+  core_remains_independent_of_same_day_thermal_imagery: true
+  eligibility:
+    maximum_image_age_days: 3.0
+    allowed_sources: [landsat, ecostress]
+    allowed_quality_flags: [good, acceptable]
+    maximum_cloud_fraction: 0.20
+    require_valid_lst: true
+    require_overpass_time: true
+  comparison:
+    refit_core_on_same_eligible_training_rows: true
+    evaluate_core_and_enhanced_on_identical_eligible_rows: true
+
+baselines:
+  background_air_temperature:
+    enabled: true
+    prediction_column: background_air_temperature_c
+  heat_index:
+    enabled: true
+    implementation: tested_rothfusz_with_low_and_high_humidity_adjustments
+    inputs: [background_air_temperature_c, background_relative_humidity_pct]
+    output_units: degC
+  satellite_lst_alone:
+    enabled: true
+    eligible_rows_only: true
+    prediction_column: satellite_lst_c
+  regularized_linear:
+    enabled: true
+    estimator: ElasticNet
+    standardize_continuous: true
+    tune_alpha: true
+    tune_l1_ratio: true
+  random_forest:
+    enabled: true
+    n_estimators: 500
+    random_state: 20260720
+    n_jobs: -1
+  neural_network:
+    enabled: false
+    framework: torch
+    device: cpu
+    hidden_units: [128, 64, 32]
+    activation: GELU
+    dropout: 0.20
+    optimizer: AdamW
+    learning_rate: 0.001
+    weight_decay: 0.0001
+    loss: Huber
+    max_epochs: 300
+    batch_size: 256
+    early_stopping_patience: 25
+    early_stopping_scope: validation_partition_only
+    standardize_continuous: true
+    deterministic: true
+
+conformal:
+  enabled: true
+  method: split_conformal_absolute_residual
+  calibration_role: calibration
+  alpha: 0.10
+  coverage: 0.90
+  order_statistic: ceil((n + 1) * (1 - alpha))
+  minimum_calibration_rows: 20
+  too_small_policy: unbounded_interval_with_warning
+  never_fit_model_on_calibration: true
+  report:
+    - empirical_coverage
+    - mean_interval_width
+    - median_interval_width
+  subgroup_coverage: true
+  guarantee_note: theoretical coverage requires exchangeability
+
+evaluation:
+  continuous_metrics: [mae, rmse, r2, spearman, mean_bias]
+  category_metrics: [accuracy, macro_f1, support_counts, confusion_matrix]
+  fixed_category_labels: [no_heat_stress, moderate, strong, very_strong, extreme]
+  threshold_recall_c: [32.0, 38.0, 46.0]
+  no_positive_case_value: unavailable
+  subgroup_columns:
+    heat_category: utci_category
+    sun_shade: sun_shade_group
+    land_cover: land_cover_class
+    coast_distance: coast_distance_group
+    time_of_day: time_of_day_group
+  bootstrap:
+    enabled: true
+    confidence_level: 0.95
+    resamples: 2000
+    seed: 20260720
+    resample_units:
+      - [spatial_block_id, date]
+      - [site_id, date]
+    weighting_modes: [observation_weighted, block_balanced]
+    paired_model_vs_baseline: true
+
+explain:
+  enabled: true
+  language: predictive_association_not_causation
+  shap:
+    global_bar: true
+    beeswarm: true
+    local_waterfall: true
+  partial_dependence_features:
+    - canopy_fraction
+    - impervious_fraction
+    - background_shortwave_radiation_w_m2
+    - background_wind_speed_m_s
+    - distance_to_coast_m
+  feature_range_extrapolation:
+    enabled: true
+    compare_against_training_min_max: true
+    warn_outside_training_range: true
+
+anomaly_detection:
+  enabled: false
+  estimator: IsolationForest
+  fit_on_training_only: true
+  contamination: auto
+  random_state: 20260720
+  use_for_exclusion: false
+
+artifacts:
+  write_only_after_explicit_runtime_command: true
+  never_write_during_import_or_validation: true
+  save:
+    - fitted_models
+    - preprocessing_objects
+    - predictions
+    - metrics
+    - plots
+    - split_manifest
+    - hashes
+    - resolved_configs
+    - experiment_metadata
+    - software_versions
+
+final_test:
+  command: final-test
+  unlock_flag: --unlock-final-test
+  require_explicit_unlock: true
+  require_frozen_hashes: true
+  hash_algorithm: sha256
+  hash_inputs:
+    - dataset_file_bytes
+    - model_config
+    - predictor_allowlist
+    - split_manifest
+  refuse_on_hash_mismatch: true
+  one_time_evaluation_intent: true
+
+logging:
+  level: INFO
+  structured: true
+  include_timestamp: true

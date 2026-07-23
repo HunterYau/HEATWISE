@@ -1,0 +1,21 @@
+# Reproducible Python 3.12 environment (resolved for Windows x86-64).
+# Install only with: .venv\Scripts\python.exe -m pip install -r requirements.txt
+numpy==2.2.6
+pandas==3.0.3
+scipy==1.18.0
+scikit-learn==1.9.0
+xgboost==3.3.0
+optuna==4.9.0
+pythermalcomfort==4.0.2
+shap==0.52.0
+matplotlib==3.11.1
+seaborn==0.13.2
+PyYAML==6.0.3
+joblib==1.5.3
+pyarrow==25.0.0
+pyproj==3.7.2
+torch==2.13.0
+pytest==9.1.1
+ruff==0.15.22
+setuptools==80.9.0
+wheel==0.45.1
