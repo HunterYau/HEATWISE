@@ -62,6 +62,7 @@ _BUILTIN_BANNED_EXACT = frozenset(
         "local_vapor_pressure_kpa",
         "pedestrian_wind_log_adjustment",
         "mrt_minus_local_air_temperature_c",
+        "public_reference_utci_c",
     }
 )
 

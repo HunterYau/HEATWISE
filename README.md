@@ -1,9 +1,24 @@
 # Urban Heat Risk AI
 
 `urban_heat_risk_ai` is a Python 3.12 framework for predicting pedestrian-level Universal
-Thermal Climate Index (UTCI) at unsensed urban locations. The continuous target is
-`calculated_utci_c`. The framework is deliberately strict about real-data provenance,
-spatiotemporal leakage, final-test locking, and fair comparison of operational models.
+Thermal Climate Index (UTCI) at unsensed urban locations. Its staged path separates public
+reference learning from later local sensor adaptation:
+
+1. **Stage 1 - public-reference initialization** fits a base XGBoost model to
+   `public_reference_utci_c` using only reviewed public online data and the operational
+   predictor allow-list. It contains no local sensor measurements.
+2. **Stage 2 - local pedestrian adaptation** loads the immutable Stage 1 bundle, derives
+   `calculated_utci_c` from collocated raw sensor measurements, and continues boosting on
+   the same frozen online-input representation. Sensor values are label-production inputs
+   only; they never enter the model matrix.
+
+Stage 1 is an initialization from public reference conditions. It is **not** evidence of
+local pedestrian-level accuracy and must not be presented as a substitute for Stage 2
+validation on independently collected local observations.
+
+The framework is deliberately strict about provenance, target leakage, frozen feature
+contracts, spatiotemporal splitting, lineage hashes, final-test locking, and fair comparison
+of operational models.
 
 This repository contains source code, configuration, documentation, and data-independent
 tests only. It contains no dataset, trained model, predictions, metrics, plot, or claimed
@@ -36,23 +51,112 @@ The module entry point works directly from an editable install:
 .venv\Scripts\python.exe -m urban_heat_risk_ai --help
 ```
 
-## First command with real data
+## Two-stage quick start
 
-After placing a real training table anywhere on the computer, run this exact command from
-the project root, replacing only the quoted path:
+The framework never downloads public data, queries an API, searches the computer, or joins
+sensor and online sources automatically. Prepare each reviewed CSV or Parquet table
+yourself and pass its exact path.
+
+Stage 1 consumes an already assembled public-reference table. Validate it first:
 
 ```powershell
-.venv\Scripts\python.exe -m urban_heat_risk_ai validate --data "C:\absolute\path\to\real_training_table.parquet"
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage1-validate --data "C:\absolute\path\to\public_reference_table.parquet"
 ```
 
-CSV is also accepted. Every observation-dependent command requires an explicit `--data`
-path. The application does not search the project, home directory, mounted drives, or any
-other location for data. A missing path produces a clear error and no training starts.
+Then explicitly train and save the base bundle:
 
-Validation is read-only: it reports column, dtype, unit, range, timestamp, duplicate-ID,
-missingness, split-role, feature-availability, and leakage problems without cleaning or
-rewriting the source table. Read [the schema](docs/DATA_SCHEMA.md) and complete [the real-data
-checklist](docs/REAL_DATA_CHECKLIST.md) before making a split manifest.
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage1-train --data "C:\absolute\path\to\public_reference_table.parquet" --output-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public"
+```
+
+Later, after collecting sensors, prepare one prejoined row-per-observation table containing
+the exact same online predictors plus the required raw sensor and provenance fields.
+Validate it against the saved Stage 1 contract:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\features.yaml" stage2-validate --data "C:\absolute\path\to\local_sensor_joined.parquet" --stage1-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public"
+```
+
+Adapt into a new directory; the Stage 1 directory remains unchanged:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\features.yaml" stage2-adapt --data "C:\absolute\path\to\local_sensor_joined.parquet" --stage1-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public" --output-dir "C:\absolute\path\to\heatwise_artifacts\stage2_local"
+```
+
+Predict from an online-input-only table with either bundle:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage2_local\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage2_local\configs\features.yaml" stage-predict --data "C:\absolute\path\to\online_only_prediction_rows.parquet" --model-dir "C:\absolute\path\to\heatwise_artifacts\stage2_local" --output "C:\absolute\path\to\heatwise_artifacts\predictions\local_utci.parquet"
+```
+
+Using each bundle's copied configuration snapshots makes later runs independent of
+subsequent edits in the checkout. The command refuses a byte-different model configuration
+or feature allow-list rather than silently adapting or predicting under a changed contract.
+
+CSV is also accepted for input. Every observation-dependent command requires an explicit
+`--data` path. A missing path produces a clear error and no training starts. Validation is
+read-only: it reports column, dtype, unit, range, timestamp, duplicate-ID, missingness,
+split-role, feature-availability, provenance, and leakage problems without cleaning or
+rewriting the source table.
+
+Global overrides precede the subcommand:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config configs\model.yaml --features-config configs\features.yaml stage1-validate --data "C:\absolute\path\to\public_reference_table.parquet"
+```
+
+Read [the schema](docs/DATA_SCHEMA.md), [the methodology](docs/METHODOLOGY.md), and
+[the real-data checklist](docs/REAL_DATA_CHECKLIST.md) before training.
+
+## Staged artifact contract
+
+Stage commands create an output directory only when training or prediction is intentionally
+run. A successful Stage 1 bundle has this layout:
+
+```text
+stage1_public/
+  configs/
+    model.yaml
+    features.yaml
+  models/
+    stage1_base.joblib
+  preprocessing/
+    stage1_preprocessor.joblib
+  schemas/
+    input_features.json
+  metadata/
+    stage1.json
+  hashes.json
+  artifact_manifest.json
+```
+
+Stage 2 writes a different bundle and preserves the parent:
+
+```text
+stage2_local/
+  configs/
+    model.yaml
+    features.yaml
+  models/
+    stage2_adapted.joblib
+  preprocessing/
+    frozen_stage1_preprocessor.joblib
+  schemas/
+    input_features.json
+  metadata/
+    stage2.json
+  lineage/
+    stage1_parent.json
+  hashes.json
+  artifact_manifest.json
+```
+
+`input_features.json` freezes raw predictor order, numeric/categorical roles, transformed
+feature names and order, categorical handling, units, predictor-policy version, and hashes.
+Stage 2 transforms with the saved Stage 1 preprocessor; it does not refit that preprocessor
+or introduce a new predictor. `stage1_parent.json` records the immutable parent bundle and
+its hashes. `artifact_manifest.json` and `hashes.json` make the model, preprocessor, schema,
+configuration, input table, and lineage auditable.
 
 ## CLI workflow
 
@@ -60,6 +164,13 @@ Global options such as `--config` and `--features-config` go before the subcomma
 are `configs/model.yaml` and `configs/features.yaml`.
 
 ```text
+stage1-validate Validate a public-only reference table without modifying it.
+stage1-train    Train and save the public-reference base model and frozen input contract.
+stage2-validate Validate a sensor-joined table against an immutable Stage 1 bundle.
+stage2-adapt    Continue Stage 1 boosting on freshly derived local UTCI labels.
+stage-predict   Predict with a Stage 1 or Stage 2 bundle from online-only inputs.
+
+# Legacy single-run research workflow
 validate     Validate a real CSV/Parquet table without modifying it.
 make-splits  Create a deterministic spatiotemporal split manifest at an explicit path.
 tune         Run blocked inner-fold Optuna tuning on development observations.
@@ -73,22 +184,33 @@ predict      Predict from an explicit operational feature table to an explicit d
 Get command-specific arguments without supplying data:
 
 ```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage1-train --help
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage2-adapt --help
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage-predict --help
 .venv\Scripts\python.exe -m urban_heat_risk_ai make-splits --help
 .venv\Scripts\python.exe -m urban_heat_risk_ai tune --help
 .venv\Scripts\python.exe -m urban_heat_risk_ai train --help
 ```
 
-A typical real-data sequence is documented with full commands in
-`docs/REAL_DATA_CHECKLIST.md`. No command should be run merely to produce a demonstration;
-use only reviewed real observations.
+The legacy commands remain available for the original single-table nested-CV research
+workflow. They do not replace the staged lineage contract. A complete staged sequence and
+the legacy workflow are documented in `docs/REAL_DATA_CHECKLIST.md`. No command should be
+run merely to produce a demonstration; use only reviewed real observations.
 
 ## Modeling contract
 
-The preregistered primary model is an unweighted `XGBRegressor` that directly predicts
-continuous UTCI from the `core` allow-list. It uses histogram trees, MAE evaluation,
-deterministic seeds, CPU execution, nested spatiotemporal blocked validation, and inner-fold
-early stopping. The outer evaluation fold never controls preprocessing, hyperparameters, or
-tree count.
+Both stages use XGBoost with the same public operational-input contract. Stage 1 fits and
+freezes the preprocessor plus base booster. Stage 2 verifies the parent artifact hashes,
+derives local UTCI labels from sensors, transforms with the frozen Stage 1 preprocessor, and
+continues boosting from the saved base booster. It saves a separate adapted artifact and
+never mutates the parent. `stage-predict` accepts either complete bundle but never accepts
+sensor measurements as model inputs.
+
+In the legacy research workflow, the preregistered primary model is an unweighted
+`XGBRegressor` that directly predicts continuous UTCI from the `core` allow-list. It uses
+histogram trees, MAE evaluation, deterministic seeds, CPU execution, nested spatiotemporal
+blocked validation, and inner-fold early stopping. The outer evaluation fold never controls
+preprocessing, hyperparameters, or tree count.
 
 The core model does not require a same-day thermal image. A separately trained
 `satellite_enhanced` model adds quality-controlled Landsat or ECOSTRESS LST variables only
@@ -109,11 +231,11 @@ observations and are never silently averaged.
 
 Fixed heat-focused categories are:
 
-- below 26 °C: no heat stress;
-- 26 to below 32 °C: moderate;
-- 32 to below 38 °C: strong;
-- 38 to below 46 °C: very strong; and
-- 46 °C or higher: extreme.
+- below 26 degrees C: no heat stress;
+- 26 to below 32 degrees C: moderate;
+- 32 to below 38 degrees C: strong;
+- 38 to below 46 degrees C: very strong; and
+- 46 degrees C or higher: extreme.
 
 See [the methodology](docs/METHODOLOGY.md) for split design, tuning/refit rules, wind-height
 conversion, component reconstruction, baselines, block bootstrap, conformal intervals,
@@ -142,6 +264,7 @@ src/urban_heat_risk_ai/
   physics.py             Humidity, wind-height, Heat Index, and UTCI physics
   schema.py              Immutable schema validation and reports
   splits.py              SpatioTemporalBlockedSplit and manifest invariants
+  staged_training.py     Frozen staged schemas, bundle integrity, and lineage
   workflows.py           CLI workflow orchestration
 tests/                    Pure, data-independent tests only
 ```
@@ -159,4 +282,7 @@ These checks do not train a model or create data/results:
 
 Tests use isolated scalar constants only for pure functions and configuration contracts.
 They must not create a synthetic table, train an estimator, or write predictions, models,
-plots, metrics, or other generated data artifacts.
+plots, metrics, or other generated data artifacts. Staged tests cover public-only Stage 1
+column rejection, Stage 2 sensor exclusion and physics, frozen feature-schema compatibility,
+lineage configuration and artifact contracts, and command parsing without performing a
+training run.

@@ -29,7 +29,7 @@ HASH_CHUNK_BYTES = 1024 * 1024
 def sha256_file(path: str | Path) -> str:
     """Return the SHA-256 digest of a file without loading it all into memory."""
 
-    source = Path(path)
+    source = Path(path).expanduser()
     if not source.is_file():
         raise ArtifactIntegrityError(f"Cannot hash missing file: {source}")
     digest = hashlib.sha256()
@@ -219,6 +219,13 @@ class ArtifactStore:
             json.dumps(value, indent=2, sort_keys=True, default=str) + "\n",
             encoding="utf-8",
         )
+        return path
+
+    def write_bytes(self, relative: str | Path, value: bytes) -> Path:
+        """Write an already frozen binary snapshot into the artifact tree."""
+
+        path = self._path(relative)
+        path.write_bytes(value)
         return path
 
     def write_dataframe(self, relative: str | Path, frame: pd.DataFrame) -> Path:

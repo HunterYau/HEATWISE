@@ -1,8 +1,8 @@
-schema_version: "1.0"
+schema_version: "2.0"
 
 project:
   name: urban_heat_risk_ai
-  version: "0.1.0"
+  version: "0.2.0"
   seed: 20260720
   deterministic: true
 
@@ -36,6 +36,91 @@ validation:
   require_at_least_one_humidity_predictor:
     - background_dew_point_c
     - background_relative_humidity_pct
+
+# The staged workflow is independent from the legacy end-to-end research workflow below.
+# Stage 1 learns a public-reference initialization. Stage 2 later continues boosting from
+# that immutable model using UTCI freshly derived from sensor measurements in memory.
+training_stages:
+  contract_version: "1.0"
+  predictor_set: core
+  common:
+    training_split_role: development
+    require_exact_ordered_input_schema: true
+    prohibit_sensor_inputs: true
+    device: cpu
+    tree_method: hist
+    eval_metric: mae
+  stage1:
+    name: public_online_base
+    target_column: public_reference_utci_c
+    target_provenance: public_online_only
+    required_public_provenance:
+      - public_source_name
+      - public_source_version
+      - public_source_license
+      - public_retrieved_at_utc
+      - public_target_method_version
+      - public_quality_flag
+    allowed_quality_flags: [pass]
+    minimum_training_rows: 50
+    xgb_parameters:
+      objective: reg:pseudohubererror
+      n_estimators: 800
+      max_depth: 6
+      learning_rate: 0.05
+      subsample: 0.85
+      colsample_bytree: 0.85
+      min_child_weight: 2.0
+      reg_alpha: 0.01
+      reg_lambda: 2.0
+      gamma: 0.0
+      huber_slope: 1.0
+    artifacts:
+      model: models/stage1_base.joblib
+      preprocessor: preprocessing/stage1_preprocessor.joblib
+      input_schema: schemas/input_features.json
+      metadata: metadata/stage1.json
+      hashes: hashes.json
+      completion_manifest: artifact_manifest.json
+  stage2:
+    name: local_sensor_adaptation
+    target_column: calculated_utci_c
+    target_provenance: derived_in_memory_from_raw_sensor_measurements
+    requires_stage1_bundle: true
+    reuse_stage1_preprocessor_without_refit: true
+    require_exact_stage1_input_schema: true
+    preserve_stage1_artifacts: true
+    allowed_quality_flags: [pass]
+    minimum_training_rows: 20
+    supplied_target_verification_tolerance_c: 0.10
+    supplied_mrt_verification_tolerance_c: 0.25
+    globe_mrt:
+      implementation: pythermalcomfort.utilities.mean_radiant_tmp
+      standard: ISO
+      globe_diameter_m: 0.15
+      globe_emissivity: 0.95
+      clip_inputs: false
+    adaptation:
+      method: continued_boosting
+      additional_trees: 300
+      parameter_overrides:
+        learning_rate: 0.03
+        subsample: 0.85
+        colsample_bytree: 0.85
+        reg_alpha: 0.01
+        reg_lambda: 2.0
+    artifacts:
+      model: models/stage2_adapted.joblib
+      frozen_preprocessor: preprocessing/frozen_stage1_preprocessor.joblib
+      input_schema: schemas/input_features.json
+      metadata: metadata/stage2.json
+      parent_lineage: lineage/stage1_parent.json
+      hashes: hashes.json
+      completion_manifest: artifact_manifest.json
+  prediction:
+    sensor_columns_required: false
+    reject_sensor_and_target_columns: true
+    category_from_continuous_prediction_only: true
 
 splits:
   implementation: SpatioTemporalBlockedSplit

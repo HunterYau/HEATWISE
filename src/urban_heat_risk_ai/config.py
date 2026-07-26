@@ -155,6 +155,111 @@ def _validate_project_contract(model: Mapping[str, Any], features: Mapping[str, 
             f"Target mismatch: model declares {target!r}, features declare {feature_target!r}."
         )
 
+    staged = model.get("training_stages")
+    if staged is not None:
+        staged_config = _require_mapping(staged, context="model.training_stages")
+        stage1 = _require_mapping(
+            staged_config.get("stage1"), context="model.training_stages.stage1"
+        )
+        stage2 = _require_mapping(
+            staged_config.get("stage2"), context="model.training_stages.stage2"
+        )
+        stage1_target = stage1.get("target_column")
+        stage2_target = stage2.get("target_column")
+        if not isinstance(stage1_target, str) or not stage1_target:
+            raise ConfigurationError(
+                "training_stages.stage1.target_column must be a non-empty string."
+            )
+        if not isinstance(stage2_target, str) or not stage2_target:
+            raise ConfigurationError(
+                "training_stages.stage2.target_column must be a non-empty string."
+            )
+        if stage1_target == stage2_target:
+            raise ConfigurationError(
+                "Stage 1 public-reference and Stage 2 sensor-derived targets must be distinct."
+            )
+        if stage1_target != "public_reference_utci_c":
+            raise ConfigurationError(
+                "training_stages.stage1.target_column must be public_reference_utci_c."
+            )
+        expected_public_provenance = (
+            "public_source_name",
+            "public_source_version",
+            "public_source_license",
+            "public_retrieved_at_utc",
+            "public_target_method_version",
+            "public_quality_flag",
+        )
+        if tuple(stage1.get("required_public_provenance", ())) != expected_public_provenance:
+            raise ConfigurationError(
+                "training_stages.stage1.required_public_provenance must match "
+                "the frozen public-source contract."
+            )
+        if stage1.get("target_provenance") != "public_online_only":
+            raise ConfigurationError(
+                "Stage 1 target provenance must be public_online_only."
+            )
+        if stage2_target != target:
+            raise ConfigurationError(
+                "training_stages.stage2.target_column must match data.target_column."
+            )
+        if stage2_target != "calculated_utci_c":
+            raise ConfigurationError(
+                "training_stages.stage2.target_column must be calculated_utci_c."
+            )
+        if (
+            stage2.get("target_provenance")
+            != "derived_in_memory_from_raw_sensor_measurements"
+        ):
+            raise ConfigurationError(
+                "Stage 2 target must be derived in memory from raw sensor measurements."
+            )
+        if stage2.get("requires_stage1_bundle") is not True:
+            raise ConfigurationError("Stage 2 must require a completed Stage 1 bundle.")
+        feature_stage_targets = features.get("training_stage_targets", {})
+        if not isinstance(feature_stage_targets, Mapping):
+            raise ConfigurationError("features.training_stage_targets must be a mapping.")
+        if feature_stage_targets.get("stage1_public") != stage1_target:
+            raise ConfigurationError(
+                "Stage 1 target differs between model.yaml and features.yaml."
+            )
+        if feature_stage_targets.get("stage2_sensor") != stage2_target:
+            raise ConfigurationError(
+                "Stage 2 target differs between model.yaml and features.yaml."
+            )
+        if feature_stage_targets.get("predictors_shared_exactly_between_stages") is not True:
+            raise ConfigurationError(
+                "The feature contract must require predictors_shared_exactly_between_stages."
+            )
+        if staged_config.get("predictor_set", "core") != "core":
+            raise ConfigurationError(
+                "The two-stage lineage currently requires the public, non-thermal core "
+                "predictor set."
+            )
+        if not bool(stage2.get("reuse_stage1_preprocessor_without_refit", False)):
+            raise ConfigurationError(
+                "Stage 2 must reuse the frozen Stage 1 preprocessor without refitting."
+            )
+        if not bool(stage2.get("require_exact_stage1_input_schema", False)):
+            raise ConfigurationError("Stage 2 must require the exact Stage 1 input schema.")
+        if not bool(stage2.get("preserve_stage1_artifacts", False)):
+            raise ConfigurationError("Stage 2 must preserve the Stage 1 artifacts.")
+        common = _require_mapping(
+            staged_config.get("common"), context="model.training_stages.common"
+        )
+        if not bool(common.get("prohibit_sensor_inputs", False)):
+            raise ConfigurationError(
+                "The staged workflow must prohibit sensor inputs."
+            )
+        if not bool(common.get("require_exact_ordered_input_schema", False)):
+            raise ConfigurationError(
+                "The staged workflow must require one exact ordered input schema."
+            )
+        if common.get("tree_method") != "hist" or common.get("device") != "cpu":
+            raise ConfigurationError(
+                "The staged XGBoost workflow must default to CPU histogram trees."
+            )
+
     split_config = _require_mapping(model["splits"], context="model.splits")
     spatial = _require_mapping(split_config.get("spatial"), context="model.splits.spatial")
     projected_crs = spatial.get("projected_crs", spatial.get("crs"))
@@ -219,4 +324,3 @@ def mutable_copy(config: Mapping[str, Any]) -> MutableMapping[str, Any]:
     """Return a deep mutable copy for callers that need runtime-only annotations."""
 
     return deepcopy(dict(config))
-

@@ -73,6 +73,72 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    stage1_validate = subparsers.add_parser(
+        "stage1-validate",
+        help="Validate a public-online-data base-training table without writing artifacts.",
+    )
+    _data_argument(stage1_validate)
+
+    stage1_train = subparsers.add_parser(
+        "stage1-train",
+        help="Train and freeze the public-data Stage 1 base XGBoost model.",
+    )
+    _data_argument(stage1_train)
+    stage1_train.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="New directory for the immutable Stage 1 model bundle.",
+    )
+
+    stage2_validate = subparsers.add_parser(
+        "stage2-validate",
+        help="Validate local sensor adaptation data against a saved Stage 1 bundle.",
+    )
+    _data_argument(stage2_validate)
+    stage2_validate.add_argument(
+        "--stage1-dir",
+        required=True,
+        type=Path,
+        help="Completed immutable Stage 1 bundle directory.",
+    )
+
+    stage2_adapt = subparsers.add_parser(
+        "stage2-adapt",
+        help="Adapt a saved Stage 1 model using sensor-derived UTCI targets.",
+    )
+    _data_argument(stage2_adapt)
+    stage2_adapt.add_argument(
+        "--stage1-dir",
+        required=True,
+        type=Path,
+        help="Completed immutable Stage 1 bundle directory.",
+    )
+    stage2_adapt.add_argument(
+        "--output-dir",
+        required=True,
+        type=Path,
+        help="New directory for the separately preserved Stage 2 adapted bundle.",
+    )
+
+    stage_predict = subparsers.add_parser(
+        "stage-predict",
+        help="Predict from a completed Stage 1 or Stage 2 bundle using online inputs only.",
+    )
+    _data_argument(stage_predict)
+    stage_predict.add_argument(
+        "--model-dir",
+        required=True,
+        type=Path,
+        help="Completed Stage 1 base or Stage 2 adapted bundle directory.",
+    )
+    stage_predict.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Explicit .csv or .parquet destination for predictions.",
+    )
+
     validate = subparsers.add_parser(
         "validate", help="Validate a real table without modifying it or writing artifacts."
     )
@@ -199,6 +265,11 @@ def _dispatch(args: argparse.Namespace) -> int:
     from urban_heat_risk_ai import workflows
 
     handlers = {
+        "stage1-validate": workflows.run_stage1_validate,
+        "stage1-train": workflows.run_stage1_train,
+        "stage2-validate": workflows.run_stage2_validate,
+        "stage2-adapt": workflows.run_stage2_adapt,
+        "stage-predict": workflows.run_stage_predict,
         "validate": workflows.run_validate,
         "make-splits": workflows.run_make_splits,
         "tune": workflows.run_tune,

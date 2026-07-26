@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urban-heat-risk-ai"
-version = "0.1.0"
-description = "Leakage-safe, human-centered urban UTCI modeling framework"
+version = "0.2.0"
+description = "Two-stage, leakage-safe urban UTCI modeling framework"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 keywords = ["UTCI", "urban heat", "environmental modeling", "spatiotemporal validation"]

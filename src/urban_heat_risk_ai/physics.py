@@ -20,6 +20,8 @@ from numpy.typing import ArrayLike, NDArray
 type NumericResult = float | NDArray[np.float64]
 type OutOfRangePolicy = Literal["raise", "nan", "clip"]
 
+PYTHERMALCOMFORT_GLOBE_MRT_STANDARD = "ISO"
+
 # pythermalcomfort/UTCI polynomial applicability limits.  The installed,
 # version-pinned implementation uses the same inclusive numerical bounds when
 # ``limit_inputs=True``.
@@ -185,6 +187,72 @@ def invert_wind_log_adjustment(
 # Descriptive aliases for configuration and documentation terminology.
 stable_wind_adjustment = wind_log_adjustment
 reconstruct_wind_from_adjustment = invert_wind_log_adjustment
+
+
+def calculate_mean_radiant_temperature_from_globe(
+    globe_temperature_c: ArrayLike,
+    air_temperature_c: ArrayLike,
+    air_speed_m_s: ArrayLike,
+    *,
+    globe_diameter_m: float,
+    globe_emissivity: float,
+    standard: str = PYTHERMALCOMFORT_GLOBE_MRT_STANDARD,
+) -> NumericResult:
+    """Derive unrounded MRT from a globe sensor using pinned pythermalcomfort.
+
+    The staged workflow freezes globe diameter and emissivity in configuration.
+    Only the ISO formulation is accepted so a configuration change cannot
+    silently switch physical methods. Inputs and outputs use SI units, and no
+    value is clipped or substituted.
+    """
+
+    if str(standard).strip().upper() != PYTHERMALCOMFORT_GLOBE_MRT_STANDARD:
+        raise ValueError("standard must be 'ISO' for the frozen Stage 2 target method")
+    diameter = float(globe_diameter_m)
+    emissivity = float(globe_emissivity)
+    if not isfinite(diameter) or diameter <= 0.0:
+        raise ValueError("globe_diameter_m must be finite and greater than zero")
+    if not isfinite(emissivity) or not 0.0 < emissivity <= 1.0:
+        raise ValueError("globe_emissivity must be finite and in (0, 1]")
+
+    globe, air, speed = np.broadcast_arrays(
+        np.asarray(globe_temperature_c, dtype=float),
+        np.asarray(air_temperature_c, dtype=float),
+        np.asarray(air_speed_m_s, dtype=float),
+    )
+    if np.any(~np.isfinite(globe)) or np.any(~np.isfinite(air)) or np.any(~np.isfinite(speed)):
+        raise ValueError("globe temperature, air temperature, and air speed must be finite")
+    if np.any(globe <= -273.15) or np.any(air <= -273.15):
+        raise ValueError("globe and air temperatures must be above absolute zero")
+    if np.any(speed < 0.0):
+        raise ValueError("air_speed_m_s cannot be negative")
+
+    try:
+        from pythermalcomfort.utilities import mean_radiant_tmp
+    except ImportError as exc:  # pragma: no cover - dependency check gives context
+        raise RuntimeError(
+            "pythermalcomfort is required for globe-derived MRT; install the pinned "
+            "project dependencies"
+        ) from exc
+
+    result = np.asarray(
+        mean_radiant_tmp(
+            tg=globe,
+            tdb=air,
+            v=speed,
+            d=diameter,
+            emissivity=emissivity,
+            standard=PYTHERMALCOMFORT_GLOBE_MRT_STANDARD,
+        ),
+        dtype=float,
+    )
+    if np.any(~np.isfinite(result)):
+        raise ValueError("the ISO globe-to-MRT calculation returned a non-finite value")
+    return _return_scalar_if_scalar(result)
+
+
+# A readable alias for target-construction callers.
+mean_radiant_temperature_from_globe = calculate_mean_radiant_temperature_from_globe
 
 
 @dataclass(frozen=True)
@@ -508,22 +576,297 @@ def calculate_utci(
     return _return_scalar_if_scalar(np.asarray(values, dtype=float))
 
 
+@dataclass(frozen=True)
+class SensorUTCITarget:
+    """One Stage 2 target derived from raw colocated sensor measurements."""
+
+    calculated_mrt_c: float
+    wind_speed_10m_m_s: float
+    calculated_utci_c: float
+    valid: bool
+    flags: tuple[str, ...]
+    wind_profile: WindProfileResult
+
+    @property
+    def applicable(self) -> bool:
+        """Alias describing whether the derived value is training-eligible."""
+
+        return self.valid
+
+
+def _wind_profile_kwargs(
+    wind_profile: Mapping[str, object] | None,
+    *,
+    roughness_length_m: float | None,
+    displacement_height_m: float | None,
+    neutral_stability: bool | None,
+    minimum_measurement_height_m: float | None,
+    maximum_measurement_height_m: float | None,
+    sensitivity_roughness_lengths_m: Sequence[float] | None,
+) -> tuple[float, float, bool, float | None, float | None, tuple[float, ...]]:
+    """Resolve the checked scalar options accepted by ``convert_wind_to_10m``."""
+
+    profile = dict(wind_profile or {})
+    applicability_raw = profile.get("applicability", {})
+    if applicability_raw is None:
+        applicability: Mapping[str, object] = {}
+    elif isinstance(applicability_raw, Mapping):
+        applicability = applicability_raw
+    else:
+        raise ValueError("wind_profile.applicability must be a mapping")
+
+    if profile.get("enabled", True) is not True:
+        raise ValueError("Stage 2 target derivation requires wind_profile.enabled=true")
+    method = str(profile.get("method", "neutral_logarithmic_profile"))
+    if method != "neutral_logarithmic_profile":
+        raise ValueError("wind_profile.method must be 'neutral_logarithmic_profile'")
+    if profile.get("source_height_column", "measurement_height_m") != "measurement_height_m":
+        raise ValueError(
+            "Stage 2 wind_profile.source_height_column must be measurement_height_m"
+        )
+    target_height = float(profile.get("target_height_m", 10.0))
+    if not isfinite(target_height) or target_height != 10.0:
+        raise ValueError("UTCI target derivation requires wind_profile.target_height_m=10.0")
+    if applicability.get("require_source_height_above_roughness_and_displacement", True) is not True:
+        raise ValueError(
+            "Stage 2 requires source height above roughness and displacement"
+        )
+    if applicability.get("assume_neutral_stability", True) is not True:
+        raise ValueError("Stage 2 target derivation requires declared neutral stability")
+    if applicability.get("reject_nonpositive_wind", False) is not False:
+        raise ValueError(
+            "Stage 2 wind policy must retain zero wind for explicit UTCI applicability flags"
+        )
+    if (
+        applicability.get("invalid_value_policy", "flag_and_return_nan")
+        != "flag_and_return_nan"
+    ):
+        raise ValueError(
+            "Stage 2 wind invalid_value_policy must be flag_and_return_nan"
+        )
+
+    roughness_raw = (
+        roughness_length_m
+        if roughness_length_m is not None
+        else profile.get("roughness_length_m")
+    )
+    if roughness_raw is None:
+        raise ValueError(
+            "roughness_length_m is required explicitly or in the wind_profile configuration"
+        )
+    displacement_raw = (
+        displacement_height_m
+        if displacement_height_m is not None
+        else profile.get("displacement_height_m", 0.0)
+    )
+    neutral_raw = (
+        neutral_stability
+        if neutral_stability is not None
+        else applicability.get("assume_neutral_stability", True)
+    )
+    minimum_raw = (
+        minimum_measurement_height_m
+        if minimum_measurement_height_m is not None
+        else applicability.get("minimum_source_height_m")
+    )
+    maximum_raw = (
+        maximum_measurement_height_m
+        if maximum_measurement_height_m is not None
+        else applicability.get("maximum_source_height_m")
+    )
+    sensitivity_raw = (
+        sensitivity_roughness_lengths_m
+        if sensitivity_roughness_lengths_m is not None
+        else profile.get("roughness_sensitivity_values_m", ())
+    )
+    if isinstance(sensitivity_raw, (str, bytes)) or not isinstance(sensitivity_raw, Sequence):
+        raise ValueError("wind-profile roughness sensitivity values must be a sequence")
+
+    return (
+        float(roughness_raw),
+        float(displacement_raw),
+        bool(neutral_raw),
+        None if minimum_raw is None else float(minimum_raw),
+        None if maximum_raw is None else float(maximum_raw),
+        tuple(float(value) for value in sensitivity_raw),
+    )
+
+
+def derive_sensor_utci_target(
+    measured_air_temperature_c: float,
+    measured_relative_humidity_pct: float,
+    measured_pedestrian_wind_speed_m_s: float,
+    measured_globe_temperature_c: float,
+    measurement_height_m: float,
+    *,
+    globe_diameter_m: float,
+    globe_emissivity: float,
+    globe_standard: str = PYTHERMALCOMFORT_GLOBE_MRT_STANDARD,
+    wind_profile: Mapping[str, object] | None = None,
+    roughness_length_m: float | None = None,
+    displacement_height_m: float | None = None,
+    neutral_stability: bool | None = None,
+    minimum_measurement_height_m: float | None = None,
+    maximum_measurement_height_m: float | None = None,
+    sensitivity_roughness_lengths_m: Sequence[float] | None = None,
+    utci_limits: Mapping[str, Sequence[float]] | None = None,
+) -> SensorUTCITarget:
+    """Derive one local UTCI target from raw sensor measurements.
+
+    Globe MRT uses the frozen ISO method. Pedestrian wind is converted to the
+    UTCI 10 m reference height using an explicit neutral logarithmic profile.
+    Invalid sensor tuples return flags and ``NaN`` for the unavailable target;
+    measured values are never clipped or silently repaired.
+    """
+
+    # Validate frozen method parameters independently of row validity.
+    diameter = float(globe_diameter_m)
+    emissivity = float(globe_emissivity)
+    if str(globe_standard).strip().upper() != PYTHERMALCOMFORT_GLOBE_MRT_STANDARD:
+        raise ValueError("globe_standard must be 'ISO' for Stage 2")
+    if not isfinite(diameter) or diameter <= 0.0:
+        raise ValueError("globe_diameter_m must be finite and greater than zero")
+    if not isfinite(emissivity) or not 0.0 < emissivity <= 1.0:
+        raise ValueError("globe_emissivity must be finite and in (0, 1]")
+    _resolve_utci_limits(utci_limits)
+
+    (
+        resolved_roughness,
+        resolved_displacement,
+        resolved_neutral,
+        resolved_minimum_height,
+        resolved_maximum_height,
+        resolved_sensitivity,
+    ) = _wind_profile_kwargs(
+        wind_profile,
+        roughness_length_m=roughness_length_m,
+        displacement_height_m=displacement_height_m,
+        neutral_stability=neutral_stability,
+        minimum_measurement_height_m=minimum_measurement_height_m,
+        maximum_measurement_height_m=maximum_measurement_height_m,
+        sensitivity_roughness_lengths_m=sensitivity_roughness_lengths_m,
+    )
+
+    air = float(measured_air_temperature_c)
+    humidity = float(measured_relative_humidity_pct)
+    pedestrian_wind = float(measured_pedestrian_wind_speed_m_s)
+    globe = float(measured_globe_temperature_c)
+    height = float(measurement_height_m)
+    flags: list[str] = []
+    if not isfinite(air):
+        flags.append("sensor:non_finite_air_temperature")
+    elif air <= -273.15:
+        flags.append("sensor:air_temperature_at_or_below_absolute_zero")
+    if not isfinite(humidity):
+        flags.append("sensor:non_finite_relative_humidity")
+    elif not 0.0 <= humidity <= 100.0:
+        flags.append("sensor:relative_humidity_out_of_range")
+    if not isfinite(pedestrian_wind):
+        flags.append("sensor:non_finite_pedestrian_wind")
+    elif pedestrian_wind < 0.0:
+        flags.append("sensor:negative_pedestrian_wind")
+    if not isfinite(globe):
+        flags.append("sensor:non_finite_globe_temperature")
+    elif globe <= -273.15:
+        flags.append("sensor:globe_temperature_at_or_below_absolute_zero")
+
+    converted_wind = convert_wind_to_10m(
+        pedestrian_wind,
+        height,
+        resolved_roughness,
+        displacement_height_m=resolved_displacement,
+        neutral_stability=resolved_neutral,
+        minimum_measurement_height_m=resolved_minimum_height,
+        maximum_measurement_height_m=resolved_maximum_height,
+        sensitivity_roughness_lengths_m=resolved_sensitivity,
+    )
+    flags.extend(f"wind_profile:{flag}" for flag in converted_wind.flags)
+
+    mrt = float("nan")
+    raw_mrt_inputs_valid = (
+        isfinite(air)
+        and air > -273.15
+        and isfinite(globe)
+        and globe > -273.15
+        and isfinite(pedestrian_wind)
+        and pedestrian_wind >= 0.0
+    )
+    if raw_mrt_inputs_valid:
+        try:
+            mrt = float(
+                calculate_mean_radiant_temperature_from_globe(
+                    globe,
+                    air,
+                    pedestrian_wind,
+                    globe_diameter_m=diameter,
+                    globe_emissivity=emissivity,
+                    standard=globe_standard,
+                )
+            )
+        except ValueError:
+            flags.append("mrt:iso_calculation_non_finite")
+
+    utci_value = float("nan")
+    can_assess_utci = (
+        isfinite(air)
+        and isfinite(humidity)
+        and isfinite(mrt)
+        and converted_wind.applicable
+    )
+    if can_assess_utci:
+        applicability = assess_utci_applicability(
+            air,
+            mrt,
+            converted_wind.wind_speed_10m_m_s,
+            humidity,
+            limits=utci_limits,
+        )
+        flags.extend(f"utci:{reason}" for reason in applicability.reasons)
+        if applicability.applicable:
+            utci_value = float(
+                calculate_utci(
+                    air,
+                    mrt,
+                    converted_wind.wind_speed_10m_m_s,
+                    humidity,
+                    out_of_range="raise",
+                    limits=utci_limits,
+                )
+            )
+
+    unique_flags = tuple(dict.fromkeys(flags))
+    valid = not unique_flags and isfinite(utci_value)
+    return SensorUTCITarget(
+        calculated_mrt_c=mrt,
+        wind_speed_10m_m_s=converted_wind.wind_speed_10m_m_s,
+        calculated_utci_c=utci_value,
+        valid=valid,
+        flags=unique_flags,
+        wind_profile=converted_wind,
+    )
+
+
 # Concise public alias while retaining the unit in the canonical name above.
 utci_si = calculate_utci
 
 
 __all__ = [
+    "PYTHERMALCOMFORT_GLOBE_MRT_STANDARD",
     "RELATIVE_HUMIDITY_RANGE_PERCENT",
+    "SensorUTCITarget",
     "UTCI_AIR_TEMPERATURE_RANGE_C",
     "UTCI_MRT_DELTA_RANGE_C",
     "UTCI_WIND_10M_RANGE_M_S",
     "UTCIApplicability",
     "WindProfileResult",
     "assess_utci_applicability",
+    "calculate_mean_radiant_temperature_from_globe",
     "calculate_utci",
     "convert_wind_to_10m",
+    "derive_sensor_utci_target",
     "invert_wind_log_adjustment",
     "logarithmic_wind_profile_to_10m",
+    "mean_radiant_temperature_from_globe",
     "relative_humidity_to_vapor_pressure",
     "rh_from_vapor_pressure",
     "saturation_vapor_pressure_kpa",

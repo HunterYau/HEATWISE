@@ -1,18 +1,131 @@
 # Methodology
 
+## Primary two-stage lifecycle
+
+The staged workflow is the operational model lineage:
+
+```text
+reviewed public table
+  -> stage1-validate
+  -> stage1-train
+  -> immutable Stage 1 base bundle
+       |
+       +-- online-only prediction (public-reference initialization)
+       |
+prejoined local sensor table
+  -> stage2-validate against Stage 1
+  -> derive local MRT and UTCI labels from raw sensors
+  -> stage2-adapt by continued boosting
+  -> separate Stage 2 adapted bundle
+       |
+       +-- online-only local pedestrian prediction
+```
+
+No step downloads data, searches for files, contacts a portal, or joins tables. The user
+prepares each real CSV or Parquet table and supplies its path explicitly.
+
+The staged commands do not accept a split-manifest argument. Both training tables must
+carry a reviewed `split_role`; fitting uses only the configured training role and accepted
+quality flags. Assign roles before modeling, using the same spatial/date separation
+principles when a held-out assessment is planned, and never revise them after inspecting
+errors.
+
+### Stage 1: public-reference initialization
+
+Stage 1 learns a base `XGBRegressor` from the ordered public operational predictor
+allow-list and the distinct target `public_reference_utci_c`. The table must carry reviewed
+public source, version, license, retrieval, target-method, and quality provenance. Every
+local sensor, instrument-calibration, sensor-derived, and local UTCI field is prohibited
+from the table as well as from the model matrix.
+
+Stage 1 fits the preprocessor on its eligible training partition and freezes:
+
+- raw feature names and order;
+- numeric and categorical roles;
+- missingness-indicator decisions;
+- learned categorical domains and transformed column order;
+- units and predictor-policy version;
+- the preprocessor and base XGBoost booster; and
+- dataset, configuration, feature-contract, schema, preprocessor, and model hashes.
+
+The resulting model is a public-reference initialization. It may be used before sensors
+exist, but such predictions are not locally calibrated pedestrian estimates and do not
+establish local accuracy. Any performance estimate must identify the public reference
+target and its support.
+
+### Stage 2: local pedestrian adaptation
+
+Stage 2 begins only after real local sensor measurements have been collected. The user
+provides one row-per-observation table already joined on stable keys. Each row has the same
+online predictors expected by Stage 1 plus collocated raw local air temperature, relative
+humidity, pedestrian wind, globe temperature, measurement height, and sensor provenance.
+
+The Stage 2 target is not accepted as an operational feature and is not trusted merely
+because a caller supplied a precomputed UTCI column. The framework derives it freshly:
+
+1. calculate MRT from measured globe temperature, local air temperature, local wind, and
+   the frozen globe diameter/emissivity and method;
+2. convert measured wind from its documented height to the UTCI 10 m reference height with
+   the configured logarithmic profile and applicability checks; and
+3. calculate continuous `calculated_utci_c` with the pinned SI UTCI wrapper,
+   `round_output=False`, and explicit range handling.
+
+Raw sensors, reconstructed physics fields, derived labels, flags, identifiers, coordinates,
+quality/calibration metadata, and split fields remain outside the model matrix. Invalid
+eligible labels fail validation or adaptation; they are not silently clipped, filled, or
+dropped.
+
+Before adaptation, Stage 2 verifies the complete Stage 1 artifact manifest and hashes. Its
+online predictor names, raw order, roles, units, and transformed feature order must match
+the saved `schemas/input_features.json`. Stage 2 invokes the saved Stage 1 preprocessor only
+for transformation; it does not refit, extend, or replace that preprocessor.
+
+Local adaptation uses XGBoost continued boosting from the saved Stage 1 booster. This
+preserves the public initialization while allowing additional trees to learn local
+pedestrian residual structure. It is not a fresh unrelated fit. The adapted model is
+written to a new output directory. The Stage 1 model, preprocessor, schema, metadata, and
+hashes remain immutable.
+
+The Stage 2 bundle records hashes for the local table, derived-target policy, configuration,
+copied frozen schema/preprocessor, adapted booster, and parent Stage 1 manifest. Its
+`lineage/stage1_parent.json` identifies the exact parent. A missing or mismatched parent
+artifact, schema, policy, preprocessor, or model hash is a stop condition.
+
+### Staged prediction
+
+`stage-predict` accepts only an explicit online-input table and either a complete Stage 1 or
+Stage 2 bundle. It verifies the bundle manifest, applies the frozen Stage 1 preprocessor,
+asserts the transformed order, and predicts with the selected booster. It neither requires
+nor accepts sensors as predictors.
+
+Predictions from the Stage 1 bundle must be labeled public-reference initialization
+predictions. Predictions from the Stage 2 bundle may be labeled locally adapted only for
+the population and conditions supported by the local adaptation data. Neither label
+implies causal interpretation or generalization outside documented support.
+
+### Staged versus legacy workflow
+
+The `validate`, `make-splits`, `tune`, `train`, `calibrate`, `evaluate`, `final-test`, and
+`predict` commands preserve the original single-table nested-CV research workflow described
+later in this document. They remain useful for full comparative studies, component models,
+conformal calibration, and a locked final test. They do not silently create a Stage 1/Stage
+2 lineage, and their artifacts are not interchangeable with staged bundles.
+
 ## Estimand and operating setting
 
 The primary task is to predict continuous pedestrian-level Universal Thermal Climate Index
-(`calculated_utci_c`) for a site-time where no local heat sensor is available. Therefore,
-every predictor must be operationally obtainable at an unsensed location. Raw coordinates
-may define spatial blocks and maps, but they are not primary predictors. Sensor readings,
+for a site-time where no local heat sensor is available. Stage 1 targets
+`public_reference_utci_c`; Stage 2 targets freshly derived `calculated_utci_c`. Every
+predictor must be operationally obtainable at an unsensed location. Raw coordinates may
+define spatial blocks and maps, but they are not primary predictors. Sensor readings,
 labels, identifiers, calibration/quality metadata, raw timestamps, and split membership are
 never predictors.
 
-The preregistered primary result is an unweighted direct UTCI XGBoost model using the
-`core` feature set. A thermal-image-enhanced model, physical-component system, weighted
-experiment, and comparison models are secondary analyses. No category classifier is fit;
-heat categories are fixed deterministic functions of continuous predictions.
+Within the legacy comparative workflow, the preregistered primary result is an unweighted
+direct UTCI XGBoost model using the `core` feature set. A thermal-image-enhanced model,
+physical-component system, weighted experiment, and comparison models are secondary
+analyses. No category classifier is fit; heat categories are fixed deterministic functions
+of continuous predictions.
 
 ## Leakage control and preprocessing
 
@@ -27,7 +140,9 @@ learned from columns that are missing in the current training partition. Categor
 variables are one-hot encoded with a fixed learned category order and unknown-category
 handling. The learned feature order is stored with the model and asserted at prediction.
 Encoders, imputers, scalers, missingness decisions, anomaly detectors, and category levels
-are fit only on the relevant training partition.
+are fit only on the relevant training partition. In the staged path, Stage 1 is that fitting
+partition; Stage 2 does not refit preprocessing and instead transforms with the frozen
+Stage 1 object.
 
 Continuous variables are standardized only for the regularized-linear and neural-network
 comparisons. XGBoost and Random Forest inputs are not standardized. Any imputation required

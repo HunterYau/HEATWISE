@@ -1,10 +1,219 @@
 # Real-data readiness checklist
 
-Use this checklist only with observations collected from real sites. Do not create a mock,
-synthetic, example, or filled-in training table to satisfy a check. If a required item is
-not available, stop and document the gap.
+Use this checklist only with reviewed real records: genuine public-source observations for
+Stage 1 and actual local sensor observations for Stage 2. Do not create a mock, synthetic,
+example, or filled-in training table to satisfy a check. If a required item is not
+available, stop and document the gap.
 
-## 1. Collection design and governance
+## Two-stage lifecycle
+
+The staged path is the recommended operational sequence. Stage 1 can run before local
+sensors exist. Stage 2 is an independent later command that consumes, but never overwrites,
+the frozen Stage 1 bundle.
+
+The application does not download public data, call an online API, search the project or
+computer, or join sensor records. Assemble reviewed tables outside the application and pass
+their exact paths.
+
+### A. Prepare the Stage 1 public-reference table
+
+- [ ] Obtain the public sources under licenses that permit the intended use.
+- [ ] Record provider, product/collection, immutable version, license, retrieval timestamp,
+  spatial/temporal support, update cadence, and quality policy.
+- [ ] Verify each row is one public site/grid-time observation with a unique `sample_id`.
+- [ ] Include `public_source_name`, `public_source_version`, `public_source_license`,
+  `public_retrieved_at_utc`, `public_target_method_version`, `public_quality_flag`, and
+  continuous `public_reference_utci_c`.
+- [ ] Document exactly how the public reference UTCI was produced, including units,
+  implementation/version, wind-height convention, and input-limit behavior.
+- [ ] Include the common site/time/block metadata and a reviewed `split_role`. Stage 1
+  fitting uses only the configured training role and accepted public quality state.
+- [ ] Include the ordered online predictors allowed by `configs/features.yaml`.
+- [ ] Confirm every predictor is available from public online sources at an unsensed
+  prediction location and time.
+- [ ] Confirm the table has no `sensor_id`, measurement height, calibration/quality field
+  for local instruments, `measured_*` value, local MRT/UTCI/category, WBGT, uncertainty,
+  sensor-derived transformation, or suspicious alias.
+- [ ] Archive the immutable table outside the model output directory and record its hash.
+
+Stage 1 is public-reference initialization. Its validation or training does not establish
+local pedestrian accuracy.
+
+### B. Validate Stage 1 without writing artifacts
+
+From the project root:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage1-validate --data "C:\absolute\path\to\public_reference_table.parquet"
+```
+
+- [ ] Review every dtype, unit, range, timestamp, missingness, duplicate-ID, split-role,
+  public-provenance, feature-availability, and leakage finding.
+- [ ] Correct the upstream table-generation process; the validator does not clean or rewrite
+  the table.
+- [ ] Confirm a missing path fails clearly and that no runtime directory is created.
+
+CSV input is also supported. If using nondefault checked-in configuration files, global
+options precede the command:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config configs\model.yaml --features-config configs\features.yaml stage1-validate --data "C:\absolute\path\to\public_reference_table.parquet"
+```
+
+### C. Train and freeze Stage 1
+
+Choose a new explicit destination:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai stage1-train --data "C:\absolute\path\to\public_reference_table.parquet" --output-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public"
+```
+
+- [ ] Confirm the command used only accepted public rows in the configured training role.
+- [ ] Confirm `public_reference_utci_c` was the target and never appeared in transformed
+  feature names.
+- [ ] Confirm no local sensor or sensor-derived column entered preprocessing or XGBoost.
+- [ ] Freeze and archive the entire bundle; do not replace files in place.
+- [ ] Treat Stage 1 predictions as public-reference initialization, not locally validated
+  pedestrian predictions.
+
+Expected Stage 1 bundle:
+
+```text
+stage1_public/
+  configs/
+    model.yaml
+    features.yaml
+  models/
+    stage1_base.joblib
+  preprocessing/
+    stage1_preprocessor.joblib
+  schemas/
+    input_features.json
+  metadata/
+    stage1.json
+  hashes.json
+  artifact_manifest.json
+```
+
+`schemas/input_features.json` must freeze the raw predictor order, numeric/categorical
+roles, transformed feature names and order, categorical handling, units, policy version,
+and hashes. Preserve this file with the model and preprocessor.
+
+### D. Collect and assemble the Stage 2 sensor-joined table
+
+- [ ] Collect real, independently reviewed local pedestrian measurements.
+- [ ] Synchronize local air temperature, RH, pedestrian wind, and globe temperature to a
+  documented tolerance and averaging period.
+- [ ] Record sensor IDs, calibration versions, measurement heights, maintenance events,
+  quality flags, and exclusions.
+- [ ] Verify the globe inventory matches the configured `globe_diameter_m`,
+  `globe_emissivity`, and calculation method. These are frozen physics settings, not model
+  inputs.
+- [ ] Prejoin exactly one row per observation using stable keys. Resolve one-to-many or
+  ambiguous online-source matches before invoking the application.
+- [ ] Supply the same online predictor names expected by the Stage 1 schema. Do not add a
+  new local feature because it happens to be available near a sensor.
+- [ ] Confirm online weather lags and rolling features are computed only from the
+  operational background source, never from local sensors.
+- [ ] Include raw `measured_air_temperature_c`, `measured_relative_humidity_pct`,
+  `measured_pedestrian_wind_speed_m_s`, and `measured_globe_temperature_c` for target
+  derivation only.
+- [ ] Include the common spatial/time metadata, sensor provenance, and reviewed
+  `split_role`; adaptation uses only configured development/quality-accepted rows.
+- [ ] Do not use caller-provided MRT, UTCI, categories, or sensor transformations as the
+  training target. The staged commands derive the target freshly.
+- [ ] Archive and hash the joined table outside both model directories.
+
+### E. Validate Stage 2 against the frozen parent
+
+Use the configuration snapshots stored inside the Stage 1 bundle. This keeps adaptation
+bound to the exact contract that trained the parent, even if the project checkout changes
+later:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\features.yaml" stage2-validate --data "C:\absolute\path\to\local_sensor_joined.parquet" --stage1-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public"
+```
+
+- [ ] Confirm every Stage 1 artifact and manifest hash verifies before label derivation.
+- [ ] Confirm raw predictor names, order, roles, units, categorical handling, transformed
+  order, policy version, and hashes match `schemas/input_features.json`.
+- [ ] Confirm the saved Stage 1 preprocessor is used only to transform Stage 2 predictors.
+  It must not be fitted or extended.
+- [ ] Review fresh MRT, wind-height, and UTCI applicability failures. Do not clip, fill, or
+  silently exclude an invalid eligible target.
+- [ ] Confirm raw sensor measurements and all target-production diagnostics are absent from
+  the operational predictor matrix.
+
+### F. Adapt into a separate Stage 2 bundle
+
+Use a new output directory. It must not be the Stage 1 directory:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\features.yaml" stage2-adapt --data "C:\absolute\path\to\local_sensor_joined.parquet" --stage1-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public" --output-dir "C:\absolute\path\to\heatwise_artifacts\stage2_local"
+```
+
+- [ ] Confirm adaptation continued boosting from `models/stage1_base.joblib`; it was not a
+  fresh unrelated fit.
+- [ ] Confirm the Stage 1 model, preprocessor, schema, metadata, and hashes are byte-for-byte
+  unchanged after adaptation.
+- [ ] Confirm Stage 2 stored a copy of the frozen Stage 1 preprocessor/schema rather than a
+  refitted preprocessing object.
+- [ ] Confirm `lineage/stage1_parent.json` identifies and hashes the exact parent bundle.
+- [ ] Confirm all local target derivation settings and software versions are recorded.
+
+Expected Stage 2 bundle:
+
+```text
+stage2_local/
+  configs/
+    model.yaml
+    features.yaml
+  models/
+    stage2_adapted.joblib
+  preprocessing/
+    frozen_stage1_preprocessor.joblib
+  schemas/
+    input_features.json
+  metadata/
+    stage2.json
+  lineage/
+    stage1_parent.json
+  hashes.json
+  artifact_manifest.json
+```
+
+### G. Predict with either complete bundle
+
+Prepare an online-only CSV or Parquet table matching the frozen input schema. Do not include
+or expect local sensors at prediction locations.
+
+With the locally adapted bundle:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage2_local\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage2_local\configs\features.yaml" stage-predict --data "C:\absolute\path\to\online_only_prediction_rows.parquet" --model-dir "C:\absolute\path\to\heatwise_artifacts\stage2_local" --output "C:\absolute\path\to\heatwise_artifacts\predictions\local_utci.parquet"
+```
+
+To intentionally use public-reference initialization before Stage 2 exists, point
+`--model-dir` at the Stage 1 directory:
+
+```powershell
+.venv\Scripts\python.exe -m urban_heat_risk_ai --config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\model.yaml" --features-config "C:\absolute\path\to\heatwise_artifacts\stage1_public\configs\features.yaml" stage-predict --data "C:\absolute\path\to\online_only_prediction_rows.parquet" --model-dir "C:\absolute\path\to\heatwise_artifacts\stage1_public" --output "C:\absolute\path\to\heatwise_artifacts\predictions\public_reference_utci.parquet"
+```
+
+- [ ] Verify the model bundle and lineage hashes before accepting predictions.
+- [ ] Preserve stable row identifiers in the output.
+- [ ] Label Stage 1 output as public-reference initialization.
+- [ ] Label Stage 2 output as locally adapted only within the documented population and
+  support.
+- [ ] Treat extrapolation and anomaly flags as diagnostics; do not claim causation.
+
+## Legacy single-table research workflow
+
+The checklist below preserves the original nested blocked-CV, component-model, conformal,
+and locked-final-test path. Use it when intentionally running that research workflow. It
+does not produce the staged artifact layout or Stage 1-to-Stage 2 lineage above.
+
+### 1. Collection design and governance
 
 - [ ] Confirm permission to use, retain, and model every sensor, weather, imagery, and GIS
   source, including any location-disclosure constraints.
@@ -21,7 +230,7 @@ not available, stop and document the gap.
 - [ ] Predefine the projected CRS and spatial-block size from scientific/geographic
   considerations. Do not compare block sizes by model performance.
 
-## 2. Sensor and label provenance
+### 2. Sensor and label provenance
 
 - [ ] Synchronize local air temperature, RH, pedestrian wind, and globe temperature to a
   documented tolerance and averaging period.
@@ -39,7 +248,7 @@ not available, stop and document the gap.
   uncertainty, confidence half-width, or another quantity.
 - [ ] Treat optional WBGT as a comparison label only, never a predictor.
 
-## 3. Operational feature provenance
+### 3. Operational feature provenance
 
 - [ ] Verify each proposed predictor appears in the exact `core_predictors` allow-list in
   `configs/features.yaml` and is available for a genuinely unsensed location.
@@ -62,7 +271,7 @@ not available, stop and document the gap.
 - [ ] Generate only the prespecified interaction columns. Record formulas and denominator
   handling for canopy-to-impervious ratios.
 
-## 4. Optional satellite-enhanced inputs
+### 4. Optional satellite-enhanced inputs
 
 - [ ] Keep the core table usable when no thermal image exists; same-day LST must not become
   a hidden core requirement.
@@ -77,7 +286,7 @@ not available, stop and document the gap.
 - [ ] Freeze maximum image age and quality eligibility before tuning.
 - [ ] Plan the enhanced-versus-core comparison on exactly the same eligible observations.
 
-## 5. Assemble the immutable table
+### 5. Assemble the immutable table
 
 - [ ] Make each row one site-time observation and assign a globally unique `sample_id`.
 - [ ] Supply all identifiers, provenance, sensor/label, and operational columns documented
@@ -91,7 +300,7 @@ not available, stop and document the gap.
 - [ ] Make a read-only archival copy outside the runtime output location and record its
   cryptographic hash.
 
-## 6. Validate without changing the table
+### 6. Validate without changing the table
 
 From the project root, run the following with the absolute path to the real table:
 
@@ -107,7 +316,7 @@ From the project root, run the following with the absolute path to the real tabl
 - [ ] If predicting on an unlabeled operational table, use `--mode prediction`; this does
   not relax predictor leakage checks.
 
-## 7. Freeze the split manifest
+### 7. Freeze the split manifest
 
 Choose an explicit manifest destination. This command intentionally creates that file only
 when you run it with real data:
@@ -124,7 +333,7 @@ when you run it with real data:
   data rather than weakening the lock silently.
 - [ ] Freeze and version the manifest. Do not overwrite it after viewing evaluation results.
 
-## 8. Tune, train, and calibrate intentionally
+### 8. Tune, train, and calibrate intentionally
 
 Select explicit runtime destinations; the application creates them only now:
 
@@ -149,7 +358,7 @@ Select explicit runtime destinations; the application creates them only now:
 - [ ] Enable satellite-enhanced and neural comparisons only deliberately; label them
   secondary.
 
-## 9. Development evaluation and interpretation
+### 9. Development evaluation and interpretation
 
 ```powershell
 .venv\Scripts\python.exe -m urban_heat_risk_ai evaluate --data "C:\absolute\path\to\real_training_table.parquet" --manifest "C:\absolute\path\to\study_artifacts\split_manifest.json" --run-dir "C:\absolute\path\to\study_artifacts\run_001"
@@ -166,7 +375,7 @@ Select explicit runtime destinations; the application creates them only now:
 - [ ] Describe SHAP and partial dependence as predictive associations, not causal effects.
 - [ ] Investigate extrapolation and anomaly warnings without automatically deleting rows.
 
-## 10. Lock and open the final test once
+### 10. Lock and open the final test once
 
 - [ ] Before opening the final test, freeze the dataset, checked-in configs, recorded runtime
   choices, predictor allow-list, manifest, code revision, selected model, baselines, subgroup

@@ -21,6 +21,34 @@ from .errors import DataRequiredError, SchemaValidationError
 from .features import FeaturePolicy, PredictorSet
 
 Severity = Literal["error", "warning"]
+ValidationStage = Literal["default", "stage1_public", "stage2_sensor", "stage_prediction"]
+
+PUBLIC_REFERENCE_TARGET = "public_reference_utci_c"
+
+STAGE1_PUBLIC_PROVENANCE_COLUMNS = (
+    "public_source_name",
+    "public_source_version",
+    "public_source_license",
+    "public_retrieved_at_utc",
+    "public_target_method_version",
+    "public_quality_flag",
+)
+
+STAGE1_OPTIONAL_PROVENANCE_COLUMNS = ("public_source_record_id",)
+
+STAGE2_SENSOR_RAW_COLUMNS = (
+    "measured_air_temperature_c",
+    "measured_relative_humidity_pct",
+    "measured_pedestrian_wind_speed_m_s",
+    "measured_globe_temperature_c",
+)
+
+STAGE2_SENSOR_PROVENANCE_COLUMNS = (
+    "sensor_id",
+    "measurement_height_m",
+    "calibration_version",
+    "quality_flag",
+)
 
 REQUIRED_METADATA = (
     "sample_id",
@@ -36,6 +64,19 @@ REQUIRED_METADATA = (
     "split_role",
 )
 
+STAGE1_REQUIRED_METADATA = (
+    "sample_id",
+    "site_id",
+    "date",
+    "timestamp_utc",
+    "latitude",
+    "longitude",
+    *STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+    "split_role",
+)
+
+STAGE2_REQUIRED_METADATA = REQUIRED_METADATA
+
 PREDICTION_METADATA = (
     "sample_id",
     "date",
@@ -45,11 +86,16 @@ PREDICTION_METADATA = (
     "measurement_height_m",
 )
 
+STAGE_PREDICTION_METADATA = (
+    "sample_id",
+    "date",
+    "timestamp_utc",
+    "latitude",
+    "longitude",
+)
+
 REQUIRED_LABELS = (
-    "measured_air_temperature_c",
-    "measured_relative_humidity_pct",
-    "measured_pedestrian_wind_speed_m_s",
-    "measured_globe_temperature_c",
+    *STAGE2_SENSOR_RAW_COLUMNS,
     "calculated_mrt_c",
     "calculated_utci_c",
     "utci_category",
@@ -72,7 +118,45 @@ OPTIONAL_KNOWN_COLUMNS = frozenset(
         "sun_shade_group",
         "coast_distance_group",
         "time_of_day_group",
+        PUBLIC_REFERENCE_TARGET,
+        *STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+        *STAGE1_OPTIONAL_PROVENANCE_COLUMNS,
     }
+)
+
+STAGE1_PROHIBITED_EXACT_COLUMNS = frozenset(
+    {
+        *STAGE2_SENSOR_RAW_COLUMNS,
+        *STAGE2_SENSOR_PROVENANCE_COLUMNS,
+        "calculated_mrt_c",
+        "calculated_mean_radiant_temperature_c",
+        "calculated_utci_c",
+        "utci_category",
+        "optional_wbgt_c",
+        "wbgt_c",
+        "label_uncertainty_c",
+        "measured_vapor_pressure_kpa",
+        "local_minus_background_air_temperature_c",
+        "local_vapor_pressure_kpa",
+        "pedestrian_wind_log_adjustment",
+        "mrt_minus_local_air_temperature_c",
+    }
+)
+
+STAGE_PREDICTION_PROHIBITED_EXACT_COLUMNS = frozenset(
+    {
+        *STAGE1_PROHIBITED_EXACT_COLUMNS,
+        *STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+        *STAGE1_OPTIONAL_PROVENANCE_COLUMNS,
+        PUBLIC_REFERENCE_TARGET,
+    }
+)
+
+_STAGE1_PROHIBITED_NAME = re.compile(
+    r"(?:^|_)(?:sensor|measured|measurement|globe|calibrat(?:ed|ion)|local)(?:_|$)"
+)
+_STAGE1_PROHIBITED_TARGET_NAME = re.compile(
+    r"(?:^|_)(?:calculated|utci|mrt|wbgt|label_uncertainty)(?:_|$)"
 )
 
 STRING_COLUMNS = frozenset(
@@ -94,6 +178,8 @@ STRING_COLUMNS = frozenset(
         "time_of_day_group",
         "satellite_thermal_source",
         "satellite_lst_quality_flag",
+        *STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+        *STAGE1_OPTIONAL_PROVENANCE_COLUMNS,
     }
 )
 
@@ -107,6 +193,7 @@ UNIT_BY_COLUMN = {
     "measured_globe_temperature_c": "degC",
     "calculated_mrt_c": "degC",
     "calculated_utci_c": "degC",
+    PUBLIC_REFERENCE_TARGET: "degC",
     "optional_wbgt_c": "degC",
     "wbgt_c": "degC",
     "label_uncertainty_c": "degC",
@@ -269,6 +356,8 @@ def _examples(series: pd.Series, mask: pd.Series, limit: int = 3) -> tuple[str, 
 
 
 def _range_for(column: str) -> tuple[float | None, float | None] | None:
+    if not isinstance(column, str):
+        return None
     exact = {
         "latitude": (-90.0, 90.0),
         "longitude": (-180.0, 180.0),
@@ -280,6 +369,7 @@ def _range_for(column: str) -> tuple[float | None, float | None] | None:
         "calculated_mrt_c": (-70.0, 120.0),
         "calculated_mean_radiant_temperature_c": (-70.0, 120.0),
         "calculated_utci_c": (-100.0, 100.0),
+        PUBLIC_REFERENCE_TARGET: (-100.0, 100.0),
         "optional_wbgt_c": (-50.0, 65.0),
         "wbgt_c": (-50.0, 65.0),
         "label_uncertainty_c": (0.0, 30.0),
@@ -354,6 +444,115 @@ def _expected_category(value: float) -> str:
     return "extreme"
 
 
+def is_stage1_prohibited_column(column: str) -> bool:
+    """Return whether a column violates the public-only Stage 1 boundary.
+
+    The check is deliberately independent of dataframe contents so ingestion
+    code can reject prohibited names before reading values.  The public target
+    has its own explicit name and is never accepted through a generic
+    ``calculated_utci_c`` or sensor-derived alias.
+    """
+
+    normalized = str(column).strip().lower()
+    stage1_public_names = {
+        PUBLIC_REFERENCE_TARGET,
+        *STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+        *STAGE1_OPTIONAL_PROVENANCE_COLUMNS,
+    }
+    if normalized in stage1_public_names:
+        return False
+    return (
+        normalized in STAGE1_PROHIBITED_EXACT_COLUMNS
+        or _STAGE1_PROHIBITED_NAME.search(normalized) is not None
+        or _STAGE1_PROHIBITED_TARGET_NAME.search(normalized) is not None
+    )
+
+
+def stage1_prohibited_columns(columns: Sequence[str]) -> tuple[str, ...]:
+    """Return sorted unique Stage 1 sensor/local/calibration column names."""
+
+    return tuple(sorted({str(column) for column in columns if is_stage1_prohibited_column(column)}))
+
+
+def is_stage_prediction_prohibited_column(column: str) -> bool:
+    """Return whether a public, sensor, local, or target field entered prediction."""
+
+    normalized = str(column).strip().lower()
+    return (
+        normalized in STAGE_PREDICTION_PROHIBITED_EXACT_COLUMNS
+        or is_stage1_prohibited_column(normalized)
+        or re.search(r"(?:^|_)(?:public|target|label|wbgt|utci_category)(?:_|$)", normalized)
+        is not None
+    )
+
+
+def stage_prediction_prohibited_columns(columns: Sequence[str]) -> tuple[str, ...]:
+    """Return sorted prohibited names from a staged inference table."""
+
+    return tuple(
+        sorted(
+            {
+                str(column)
+                for column in columns
+                if is_stage_prediction_prohibited_column(column)
+            }
+        )
+    )
+
+
+@dataclass(frozen=True)
+class StageSchemaProfile:
+    """Declarative required-column contract for one training stage."""
+
+    name: ValidationStage
+    required_metadata: tuple[str, ...]
+    required_target_inputs: tuple[str, ...]
+    prohibited_columns: frozenset[str] = frozenset()
+
+
+DEFAULT_SCHEMA_PROFILE = StageSchemaProfile(
+    name="default",
+    required_metadata=REQUIRED_METADATA,
+    required_target_inputs=REQUIRED_LABELS,
+)
+STAGE1_SCHEMA_PROFILE = StageSchemaProfile(
+    name="stage1_public",
+    required_metadata=STAGE1_REQUIRED_METADATA,
+    required_target_inputs=(PUBLIC_REFERENCE_TARGET,),
+    prohibited_columns=STAGE1_PROHIBITED_EXACT_COLUMNS,
+)
+STAGE2_SCHEMA_PROFILE = StageSchemaProfile(
+    name="stage2_sensor",
+    required_metadata=STAGE2_REQUIRED_METADATA,
+    required_target_inputs=STAGE2_SENSOR_RAW_COLUMNS,
+)
+STAGE_PREDICTION_SCHEMA_PROFILE = StageSchemaProfile(
+    name="stage_prediction",
+    required_metadata=STAGE_PREDICTION_METADATA,
+    required_target_inputs=(),
+    prohibited_columns=STAGE_PREDICTION_PROHIBITED_EXACT_COLUMNS,
+)
+
+SCHEMA_PROFILES: Mapping[ValidationStage, StageSchemaProfile] = {
+    "default": DEFAULT_SCHEMA_PROFILE,
+    "stage1_public": STAGE1_SCHEMA_PROFILE,
+    "stage2_sensor": STAGE2_SCHEMA_PROFILE,
+    "stage_prediction": STAGE_PREDICTION_SCHEMA_PROFILE,
+}
+
+
+def schema_profile_for_stage(stage: ValidationStage) -> StageSchemaProfile:
+    """Return the immutable schema contract for ``stage``."""
+
+    try:
+        return SCHEMA_PROFILES[stage]
+    except KeyError as exc:
+        raise ValueError(
+            "validation_stage must be one of: 'default', 'stage1_public', "
+            "'stage2_sensor', 'stage_prediction'"
+        ) from exc
+
+
 class SchemaValidator:
     """Non-mutating validator parameterized by the predictor policy."""
 
@@ -367,6 +566,7 @@ class SchemaValidator:
         require_labels: bool = True,
         require_split_role: bool = True,
         strict_unknown_columns: bool = True,
+        validation_stage: ValidationStage = "default",
     ) -> None:
         self.feature_policy = feature_policy
         self.predictor_set = predictor_set
@@ -375,6 +575,10 @@ class SchemaValidator:
         self.require_labels = require_labels
         self.require_split_role = require_split_role
         self.strict_unknown_columns = strict_unknown_columns
+        self.validation_stage = validation_stage
+        self.stage_profile = schema_profile_for_stage(validation_stage)
+        if validation_stage == "stage_prediction" and predictor_set != "core":
+            raise ValueError("stage_prediction validation uses the exact core predictor schema")
 
     def validate(
         self, frame: pd.DataFrame, *, units: Mapping[str, str] | None = None
@@ -432,11 +636,19 @@ class SchemaValidator:
                 f"Columns must use exact lower snake_case names: {invalid_names}",
                 hint="Use the canonical names in docs/DATA_SCHEMA.md and configs/features.yaml.",
             )
+        if duplicate_column_names:
+            return ValidationReport(len(frame), len(frame.columns), tuple(issues))
 
-        metadata_contract = REQUIRED_METADATA if self.require_labels else PREDICTION_METADATA
+        if self.validation_stage == "default":
+            metadata_contract = REQUIRED_METADATA if self.require_labels else PREDICTION_METADATA
+            required_target_inputs = REQUIRED_LABELS if self.require_labels else ()
+        else:
+            metadata_contract = self.stage_profile.required_metadata
+            required_target_inputs = (
+                self.stage_profile.required_target_inputs if self.require_labels else ()
+            )
         required = set(metadata_contract)
-        if self.require_labels:
-            required.update(REQUIRED_LABELS)
+        required.update(required_target_inputs)
         if not self.require_split_role:
             required.discard("split_role")
         required.update(self.feature_policy.allowed_predictors(self.predictor_set))
@@ -454,7 +666,49 @@ class SchemaValidator:
                     else "Add the real measured/operational field using the documented name and unit."
                 ),
             )
-        if "spatial_block_id" not in frame.columns and not self.require_spatial_block:
+        if self.validation_stage == "stage1_public":
+            prohibited = stage1_prohibited_columns(tuple(str(column) for column in frame.columns))
+            if prohibited:
+                add(
+                    "error",
+                    "stage1_prohibited_columns",
+                    "Stage 1 is public-only and cannot contain sensor, local-observation, "
+                    f"calibration, or legacy calculated-target fields: {list(prohibited)}",
+                    hint=(
+                        "Remove these fields from the Stage 1 input table. Use "
+                        f"{PUBLIC_REFERENCE_TARGET} with the required public provenance fields."
+                    ),
+                )
+        elif self.validation_stage == "stage_prediction":
+            prohibited = stage_prediction_prohibited_columns(
+                tuple(str(column) for column in frame.columns)
+            )
+            if prohibited:
+                add(
+                    "error",
+                    "stage_prediction_prohibited_columns",
+                    "Staged prediction accepts operational predictors only; public-reference, "
+                    f"sensor, local-observation, calibration, and target fields are forbidden: "
+                    f"{list(prohibited)}",
+                    hint="Pass only the frozen core feature schema and required inference metadata.",
+                )
+            exact_allowed = set(STAGE_PREDICTION_METADATA)
+            exact_allowed.update(self.feature_policy.allowed_predictors("core"))
+            extra = sorted(
+                {str(column) for column in frame.columns if column not in exact_allowed}
+            )
+            if extra:
+                add(
+                    "error",
+                    "stage_prediction_extra_columns",
+                    f"Columns fall outside the exact frozen core inference schema: {extra}",
+                    hint="Remove every non-core field; never let identifiers or targets reach inference.",
+                )
+        if (
+            self.validation_stage != "stage_prediction"
+            and "spatial_block_id" not in frame.columns
+            and not self.require_spatial_block
+        ):
             add(
                 "warning",
                 "spatial_block_not_yet_assigned",
@@ -464,10 +718,13 @@ class SchemaValidator:
             )
 
         known = set(REQUIRED_METADATA + REQUIRED_LABELS) | OPTIONAL_KNOWN_COLUMNS
+        known.update(STAGE1_REQUIRED_METADATA)
+        known.update(STAGE1_OPTIONAL_PROVENANCE_COLUMNS)
+        known.add(PUBLIC_REFERENCE_TARGET)
         known.update(self.feature_policy.allowed_predictors("satellite_enhanced"))
         known.update(self.feature_policy.metadata_columns)
         known.update(self.feature_policy.label_and_sensor_columns)
-        unknown = sorted(set(frame.columns).difference(known))
+        unknown = sorted({str(column) for column in frame.columns if column not in known})
         if unknown and self.strict_unknown_columns:
             add(
                 "error",
@@ -495,9 +752,38 @@ class SchemaValidator:
             )
             warning_fraction, error_fraction = 0.20, 0.80
 
+        stage2_physics_columns = {
+            *STAGE2_SENSOR_RAW_COLUMNS,
+            "measurement_height_m",
+        }
+        stage2_eligible = pd.Series(True, index=frame.index, dtype=bool)
+        if self.validation_stage == "stage2_sensor":
+            staged_config = self.model_config.get("training_stages", {})
+            if not isinstance(staged_config, Mapping):
+                staged_config = {}
+            common_config = staged_config.get("common", {})
+            if not isinstance(common_config, Mapping):
+                common_config = {}
+            stage2_config = staged_config.get("stage2", {})
+            if not isinstance(stage2_config, Mapping):
+                stage2_config = {}
+            role = str(common_config.get("training_split_role", "development"))
+            allowed_quality = {
+                str(value).strip().lower()
+                for value in stage2_config.get("allowed_quality_flags", ("pass",))
+            }
+            if {"split_role", "quality_flag"}.issubset(frame.columns):
+                stage2_eligible = (
+                    frame["split_role"].astype("string").str.strip().eq(role)
+                    & frame["quality_flag"]
+                    .astype("string")
+                    .str.strip()
+                    .str.lower()
+                    .isin(allowed_quality)
+                ).fillna(False)
+
         non_nullable = set(metadata_contract)
-        if self.require_labels:
-            non_nullable.update(REQUIRED_LABELS)
+        non_nullable.update(required_target_inputs)
         if not self.require_split_role:
             non_nullable.discard("split_role")
         if self.require_spatial_block:
@@ -506,12 +792,23 @@ class SchemaValidator:
             missing_mask = frame[column].isna()
             if pdt.is_object_dtype(frame[column].dtype) or pdt.is_string_dtype(frame[column].dtype):
                 missing_mask |= frame[column].astype("string").str.strip().eq("").fillna(False)
+            if (
+                self.validation_stage == "stage2_sensor"
+                and column in stage2_physics_columns
+            ):
+                missing_mask &= stage2_eligible
             count = int(missing_mask.sum())
             if count:
                 add(
                     "error",
                     "missing_nonnullable",
-                    "Required metadata/sensor/label values may not be missing or blank.",
+                    (
+                        "Required Stage 2 target-production values may not be "
+                        "missing or blank on eligible training rows."
+                        if column in stage2_physics_columns
+                        and self.validation_stage == "stage2_sensor"
+                        else "Required metadata/sensor/label values may not be missing or blank."
+                    ),
                     column=column,
                     row_count=count,
                     hint="Resolve the source/provenance gap; the validator will not impute labels or metadata.",
@@ -553,7 +850,7 @@ class SchemaValidator:
         categorical_columns = set(STRING_COLUMNS)
         categorical_columns.update(self.feature_policy.categorical_predictors(self.predictor_set))
         for column in frame.columns:
-            if column == "timestamp_utc":
+            if column in {"timestamp_utc", "public_retrieved_at_utc"}:
                 continue
             if column in categorical_columns:
                 if not (
@@ -603,6 +900,11 @@ class SchemaValidator:
                 continue
             values = pd.to_numeric(frame[column], errors="coerce")
             finite_bad = values.notna() & ~np.isfinite(values)
+            if (
+                self.validation_stage == "stage2_sensor"
+                and column in stage2_physics_columns
+            ):
+                finite_bad &= stage2_eligible
             if bool(finite_bad.any()):
                 add(
                     "error",
@@ -619,6 +921,11 @@ class SchemaValidator:
                 bad |= values < low
             if high is not None:
                 bad |= values > high
+            if (
+                self.validation_stage == "stage2_sensor"
+                and column in stage2_physics_columns
+            ):
+                bad &= stage2_eligible
             if bool(bad.any()):
                 range_text = f"[{low if low is not None else '-inf'}, {high if high is not None else 'inf'}]"
                 add(
@@ -645,11 +952,84 @@ class SchemaValidator:
                 )
 
         self._validate_timestamps(frame, add)
+        if self.validation_stage == "stage1_public":
+            self._validate_public_provenance(frame, add)
         self._validate_ids_roles_and_categories(frame, allowed_roles, add)
         self._validate_cross_field_physics(frame, add)
         self._validate_units(frame, units, add)
 
         return ValidationReport(len(frame), len(frame.columns), tuple(issues))
+
+    def _validate_public_provenance(self, frame: pd.DataFrame, add: Any) -> None:
+        retrieved_column = "public_retrieved_at_utc"
+        if retrieved_column in frame.columns:
+            invalid: list[Any] = []
+            naive: list[Any] = []
+            non_utc: list[Any] = []
+            for value in frame[retrieved_column].tolist():
+                if pd.isna(value):
+                    continue
+                try:
+                    parsed = pd.Timestamp(value)
+                except (TypeError, ValueError, OverflowError):
+                    invalid.append(value)
+                    continue
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    naive.append(value)
+                elif parsed.utcoffset().total_seconds() != 0:
+                    non_utc.append(value)
+            for code, values, message, hint in (
+                (
+                    "invalid_public_retrieval_timestamp",
+                    invalid,
+                    "public_retrieved_at_utc contains unparseable values.",
+                    "Record the actual public-source retrieval instant as ISO-8601 UTC.",
+                ),
+                (
+                    "naive_public_retrieval_timestamp",
+                    naive,
+                    "public_retrieved_at_utc must be timezone-aware.",
+                    "Attach the verified UTC offset; do not infer one during validation.",
+                ),
+                (
+                    "non_utc_public_retrieval_timestamp",
+                    non_utc,
+                    "public_retrieved_at_utc must carry a zero UTC offset.",
+                    "Convert the retrieval instant to Z or +00:00 upstream.",
+                ),
+            ):
+                if values:
+                    add(
+                        "error",
+                        code,
+                        message,
+                        column=retrieved_column,
+                        row_count=len(values),
+                        examples=tuple(repr(value) for value in values[:3]),
+                        hint=hint,
+                    )
+
+        stages_config = self.model_config.get("training_stages", {})
+        if not isinstance(stages_config, Mapping):
+            stages_config = {}
+        stage1_config = stages_config.get("stage1", {})
+        if not isinstance(stage1_config, Mapping):
+            stage1_config = {}
+        configured_flags = stage1_config.get("allowed_quality_flags", ())
+        allowed_flags = {str(value) for value in configured_flags}
+        if allowed_flags and "public_quality_flag" in frame.columns:
+            supplied = frame["public_quality_flag"].astype("string")
+            invalid_flags = supplied.notna() & ~supplied.isin(allowed_flags)
+            if bool(invalid_flags.any()):
+                add(
+                    "error",
+                    "invalid_public_quality_flag",
+                    f"public_quality_flag must be one of {sorted(allowed_flags)}.",
+                    column="public_quality_flag",
+                    row_count=int(invalid_flags.sum()),
+                    examples=_examples(frame["public_quality_flag"], invalid_flags),
+                    hint="Apply the frozen Stage 1 public-source quality policy upstream.",
+                )
 
     @staticmethod
     def _validate_timestamps(frame: pd.DataFrame, add: Any) -> None:
@@ -906,6 +1286,7 @@ def validate_schema(
     require_labels: bool = True,
     require_split_role: bool = True,
     strict_unknown_columns: bool = True,
+    validation_stage: ValidationStage = "default",
     units: Mapping[str, str] | None = None,
 ) -> ValidationReport:
     """Functional wrapper around :class:`SchemaValidator`."""
@@ -918,10 +1299,129 @@ def validate_schema(
         require_labels=require_labels,
         require_split_role=require_split_role,
         strict_unknown_columns=strict_unknown_columns,
+        validation_stage=validation_stage,
     ).validate(frame, units=units)
 
 
 def validate_schema_or_raise(*args: Any, **kwargs: Any) -> ValidationReport:
     report = validate_schema(*args, **kwargs)
+    report.raise_for_errors()
+    return report
+
+
+def validate_stage1_schema(
+    frame: pd.DataFrame,
+    feature_policy: FeaturePolicy,
+    *,
+    predictor_set: PredictorSet = "core",
+    model_config: Mapping[str, Any] | None = None,
+    require_spatial_block: bool = False,
+    require_split_role: bool = True,
+    strict_unknown_columns: bool = True,
+    units: Mapping[str, str] | None = None,
+) -> ValidationReport:
+    """Validate a public-only Stage 1 training table.
+
+    Stage 1 requires its distinct public UTCI reference and complete public
+    provenance, and rejects sensor/local/calibration fields even when unknown
+    column checking is relaxed.
+    """
+
+    return validate_schema(
+        frame,
+        feature_policy,
+        predictor_set=predictor_set,
+        model_config=model_config,
+        require_spatial_block=require_spatial_block,
+        require_labels=True,
+        require_split_role=require_split_role,
+        strict_unknown_columns=strict_unknown_columns,
+        validation_stage="stage1_public",
+        units=units,
+    )
+
+
+def validate_stage2_schema(
+    frame: pd.DataFrame,
+    feature_policy: FeaturePolicy,
+    *,
+    predictor_set: PredictorSet = "core",
+    model_config: Mapping[str, Any] | None = None,
+    require_spatial_block: bool = False,
+    require_split_role: bool = True,
+    strict_unknown_columns: bool = True,
+    units: Mapping[str, str] | None = None,
+) -> ValidationReport:
+    """Validate Stage 2 operational predictors plus raw sensor target inputs.
+
+    Precomputed MRT, UTCI, UTCI category, and uncertainty columns are not
+    required: Stage 2 derives its target from the four raw measurements using
+    the frozen physical configuration.
+    """
+
+    return validate_schema(
+        frame,
+        feature_policy,
+        predictor_set=predictor_set,
+        model_config=model_config,
+        require_spatial_block=require_spatial_block,
+        require_labels=True,
+        require_split_role=require_split_role,
+        strict_unknown_columns=strict_unknown_columns,
+        validation_stage="stage2_sensor",
+        units=units,
+    )
+
+
+def validate_stage_prediction_schema(
+    frame: pd.DataFrame,
+    feature_policy: FeaturePolicy,
+    *,
+    model_config: Mapping[str, Any] | None = None,
+    strict_unknown_columns: bool = True,
+    units: Mapping[str, str] | None = None,
+) -> ValidationReport:
+    """Validate the exact operational-input contract used by staged prediction.
+
+    No sensor height, sensor provenance, public-reference provenance, split
+    metadata, or target is accepted or required.
+    """
+
+    return validate_schema(
+        frame,
+        feature_policy,
+        predictor_set="core",
+        model_config=model_config,
+        require_spatial_block=False,
+        require_labels=False,
+        require_split_role=False,
+        strict_unknown_columns=strict_unknown_columns,
+        validation_stage="stage_prediction",
+        units=units,
+    )
+
+
+def validate_stage1_schema_or_raise(*args: Any, **kwargs: Any) -> ValidationReport:
+    """Validate Stage 1 and raise :class:`SchemaValidationError` on errors."""
+
+    report = validate_stage1_schema(*args, **kwargs)
+    report.raise_for_errors()
+    return report
+
+
+def validate_stage2_schema_or_raise(*args: Any, **kwargs: Any) -> ValidationReport:
+    """Validate Stage 2 and raise :class:`SchemaValidationError` on errors."""
+
+    report = validate_stage2_schema(*args, **kwargs)
+    report.raise_for_errors()
+    return report
+
+
+def validate_stage_prediction_schema_or_raise(
+    *args: Any, **kwargs: Any
+) -> ValidationReport:
+    """Validate staged inference inputs and raise on any contract violation."""
+
+    report = validate_stage_prediction_schema(*args, **kwargs)
     report.raise_for_errors()
     return report

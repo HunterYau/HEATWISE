@@ -1,6 +1,10 @@
-schema_version: "1.0"
-predictor_set_version: "1.0.0"
+schema_version: "2.0"
+predictor_set_version: "1.1.0"
 target_column: calculated_utci_c
+training_stage_targets:
+  stage1_public: public_reference_utci_c
+  stage2_sensor: calculated_utci_c
+  predictors_shared_exactly_between_stages: true
 
 # Exact operational columns allowed for the preregistered primary model. Every feature
 # must be available at an unsensed location. Lags and summaries refer only to operational
@@ -223,8 +227,16 @@ metadata_columns:
   - calibration_version
   - quality_flag
   - split_role
+  - public_source_name
+  - public_source_version
+  - public_source_license
+  - public_retrieved_at_utc
+  - public_target_method_version
+  - public_quality_flag
+  - public_source_record_id
 
 label_and_sensor_columns: &label_and_sensor_columns
+  - public_reference_utci_c
   - measured_air_temperature_c
   - measured_relative_humidity_pct
   - measured_pedestrian_wind_speed_m_s
@@ -264,6 +276,14 @@ banned_exact: &banned_exact
   - fold
   - outer_fold
   - inner_fold
+  - public_source_name
+  - public_source_version
+  - public_source_license
+  - public_retrieved_at_utc
+  - public_target_method_version
+  - public_quality_flag
+  - public_source_record_id
+  - public_reference_utci_c
   - measured_air_temperature_c
   - measured_relative_humidity_pct
   - measured_pedestrian_wind_speed_m_s
@@ -286,6 +306,7 @@ banned_exact: &banned_exact
 prohibited_exact: *banned_exact
 
 prohibited_prefixes:
+  - public_reference_
   - measured_
   - calculated_
   - target_

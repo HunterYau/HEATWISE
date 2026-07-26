@@ -8,8 +8,10 @@ leakage guard immediately before preprocessing/model fitting.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from collections.abc import Mapping
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,6 +65,7 @@ from urban_heat_risk_ai.direct_xgb import (
     FittedDirectModel,
     IndexFold,
     TuningResult,
+    adapt_from_frozen_base,
     fit_fixed_model,
     refit_outer_model,
     tune_inner_cv,
@@ -91,13 +94,33 @@ from urban_heat_risk_ai.metrics import (
     paired_block_bootstrap_improvement,
     time_of_day_groups,
 )
-from urban_heat_risk_ai.schema import load_observations, validate_schema
+from urban_heat_risk_ai.schema import (
+    PUBLIC_REFERENCE_TARGET,
+    STAGE1_PUBLIC_PROVENANCE_COLUMNS,
+    STAGE2_SENSOR_PROVENANCE_COLUMNS,
+    STAGE2_SENSOR_RAW_COLUMNS,
+    load_observations,
+    validate_schema,
+    validate_stage1_schema,
+    validate_stage2_schema,
+    validate_stage_prediction_schema,
+)
 from urban_heat_risk_ai.splits import (
     BlockedFold,
     SpatioTemporalBlockedSplit,
     assert_split_invariants,
     read_or_create_split_manifest,
     validate_manifest_matches_data,
+)
+from urban_heat_risk_ai.staged_training import (
+    StageInputFeatureSchema,
+    derive_stage2_target_batch,
+    ensure_separate_stage_output,
+    load_completed_stage_bundle,
+    parent_lineage_record,
+    select_stage_training_rows,
+    stage_config,
+    write_completed_stage_bundle,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -570,6 +593,590 @@ def _nested_direct_tune(
         "final_selection": _tuning_summary(final_selection),
     }
     return summary, oof, studies
+
+
+def _stage_validation(
+    args: Any,
+    *,
+    stage: str,
+) -> tuple[ProjectConfig, FeaturePolicy, pd.DataFrame, Any, dict[str, Any]]:
+    """Load one explicit table and apply its stage-specific, non-mutating schema."""
+
+    initial_project, _ = _load_project(args)
+    initial_model_snapshot = initial_project.model_path.read_bytes()
+    initial_feature_snapshot = initial_project.features_path.read_bytes()
+    project = load_project_config(
+        initial_project.model_path,
+        initial_project.features_path,
+    )
+    model_snapshot = project.model_path.read_bytes()
+    feature_snapshot = project.features_path.read_bytes()
+    if (
+        initial_model_snapshot != model_snapshot
+        or initial_feature_snapshot != feature_snapshot
+        or initial_project.model != project.model
+        or initial_project.features != project.features
+    ):
+        raise ArtifactIntegrityError(
+            "A staged-training configuration changed while it was being loaded. "
+            "No validation or training was started."
+        )
+    policy = FeaturePolicy.from_mapping(project.features)
+    data_path = Path(args.data).expanduser()
+    if not data_path.exists():
+        raise DataRequiredError(
+            f"Observation file was not found: {data_path}. Supply an existing real "
+            "CSV or Parquet file with --data."
+        )
+    if not data_path.is_file():
+        raise DataRequiredError(
+            f"The --data path must name a file, not a directory: {data_path}"
+        )
+    data_hash_before = sha256_file(data_path)
+    frame = load_observations(args.data)
+    data_hash_after = sha256_file(data_path)
+    if data_hash_after != data_hash_before:
+        raise ArtifactIntegrityError(
+            "The observation file changed while it was being read. Re-run with an "
+            "immutable input snapshot."
+        )
+    sources: dict[str, Any] = {
+        "data_sha256": data_hash_before,
+        "model_config_sha256": hashlib.sha256(model_snapshot).hexdigest(),
+        "feature_allowlist_sha256": hashlib.sha256(feature_snapshot).hexdigest(),
+        "model_config_snapshot": model_snapshot,
+        "feature_config_snapshot": feature_snapshot,
+    }
+    if stage == "stage1":
+        report = validate_stage1_schema(
+            frame,
+            policy,
+            predictor_set="core",
+            model_config=project.model,
+            require_spatial_block=False,
+            require_split_role=True,
+            strict_unknown_columns=True,
+        )
+    elif stage == "stage2":
+        report = validate_stage2_schema(
+            frame,
+            policy,
+            predictor_set="core",
+            model_config=project.model,
+            require_spatial_block=False,
+            require_split_role=True,
+            strict_unknown_columns=True,
+        )
+    elif stage == "prediction":
+        report = validate_stage_prediction_schema(
+            frame,
+            policy,
+            model_config=project.model,
+            strict_unknown_columns=True,
+        )
+    else:  # pragma: no cover - private callers use only fixed literals
+        raise ValueError(f"Unknown staged-training validation profile: {stage}")
+    return project, policy, frame, report, sources
+
+
+def _assert_stage_sources_unchanged(
+    data_path: Path,
+    project: ProjectConfig,
+    sources: Mapping[str, Any],
+) -> None:
+    """Fail before completion if a loaded training source changed in place."""
+
+    observed = {
+        "data_sha256": sha256_file(data_path),
+        "model_config_sha256": sha256_file(project.model_path),
+        "feature_allowlist_sha256": sha256_file(project.features_path),
+    }
+    mismatches = {
+        name: (sources.get(name), digest)
+        for name, digest in observed.items()
+        if sources.get(name) != digest
+    }
+    if mismatches:
+        raise ArtifactIntegrityError(
+            f"Staged-training source files changed after loading: {mismatches}"
+        )
+
+
+def _finite_stage_target(frame: pd.DataFrame, column: str) -> np.ndarray:
+    """Extract a required continuous target without coercing bad source values."""
+
+    values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float)
+    invalid = ~np.isfinite(values)
+    if invalid.any():
+        positions = np.flatnonzero(invalid)
+        examples = [
+            str(frame.iloc[int(position)]["sample_id"])
+            for position in positions[:5]
+        ]
+        raise ValueError(
+            f"{column} must be finite for every eligible training row; "
+            f"{int(invalid.sum())} invalid value(s), sample examples: {examples}."
+        )
+    return values
+
+
+def _stage_core_matrix(
+    frame: pd.DataFrame,
+    policy: FeaturePolicy,
+    *,
+    required_order: tuple[str, ...] | None = None,
+) -> pd.DataFrame:
+    """Build and guard the exact online-only matrix shared by both stages."""
+
+    matrix = build_predictor_frame(frame, policy, "core", require_all=True)
+    LeakageGuard(policy, "core").validate(tuple(str(name) for name in matrix.columns))
+    if required_order is not None and tuple(matrix.columns) != required_order:
+        raise ArtifactIntegrityError(
+            "The current online predictors do not exactly match the frozen Stage 1 "
+            "input-feature order."
+        )
+    return matrix
+
+
+def _verify_stage_model_config(
+    bundle: Any,
+    project: ProjectConfig,
+) -> None:
+    """Require the current staged-training configuration to match Stage 1."""
+
+    observed = sha256_file(project.model_path)
+    expected = bundle.input_schema.stage1_model_config_sha256
+    if observed != expected:
+        raise ArtifactIntegrityError(
+            "The current model configuration differs from the configuration frozen "
+            "with Stage 1. Use the Stage 1 configuration snapshot or train a new "
+            "Stage 1 bundle."
+        )
+
+
+def _stage_bundle_disk_hashes(bundle: Any) -> dict[str, str]:
+    """Rehash a loaded bundle so adaptation can prove parent immutability."""
+
+    artifacts = bundle.manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping):
+        raise ArtifactIntegrityError("Stage bundle manifest lacks artifact references.")
+    observed = {
+        "completion_manifest": sha256_file(
+            bundle.root / "artifact_manifest.json"
+        )
+    }
+    for logical_name, reference in artifacts.items():
+        if not isinstance(reference, Mapping) or not isinstance(
+            reference.get("path"), str
+        ):
+            raise ArtifactIntegrityError(
+                f"Stage bundle artifact reference {logical_name!r} is incomplete."
+            )
+        path = (bundle.root / str(reference["path"])).resolve()
+        if not path.is_relative_to(bundle.root.resolve()):
+            raise ArtifactIntegrityError(
+                f"Stage bundle artifact {logical_name!r} escapes its root."
+            )
+        digest = sha256_file(path)
+        if digest != reference.get("sha256"):
+            raise ArtifactIntegrityError(
+                f"Stage bundle artifact {logical_name!r} changed after loading."
+            )
+        observed[str(logical_name)] = digest
+    return observed
+
+
+def _assert_stage_bundle_unchanged(
+    bundle: Any,
+    expected: Mapping[str, str],
+) -> dict[str, str]:
+    observed = _stage_bundle_disk_hashes(bundle)
+    mismatches = {
+        name: (expected.get(name), digest)
+        for name, digest in observed.items()
+        if expected.get(name) != digest
+    }
+    if mismatches:
+        raise ArtifactIntegrityError(
+            f"The immutable Stage 1 bundle changed during adaptation: {mismatches}"
+        )
+    return observed
+
+
+def _stage_cpu_settings(project: ProjectConfig) -> tuple[int, int]:
+    direct = project.model.get("direct_xgb", {})
+    if not isinstance(direct, Mapping):
+        direct = {}
+    return project.seed, int(direct.get("n_jobs", 1))
+
+
+def run_stage1_validate(args: Any) -> int:
+    """Validate a public-online Stage 1 table and write nothing."""
+
+    project, policy, frame, report, _ = _stage_validation(args, stage="stage1")
+    print(report.format_text())
+    if not report.is_valid:
+        return 2
+    selected, counts = select_stage_training_rows(
+        frame,
+        stage="stage1",
+        project=project,
+    )
+    _stage_core_matrix(selected, policy)
+    _finite_stage_target(selected, PUBLIC_REFERENCE_TARGET)
+    LOGGER.info(
+        "Stage 1 validation ready: %d of %d rows are eligible public training rows",
+        counts["eligible_training_rows"],
+        counts["input_rows"],
+    )
+    return 0
+
+
+def run_stage1_train(args: Any) -> int:
+    """Train and freeze the public-data base model in a new Stage 1 bundle."""
+
+    project, policy, frame, report, sources = _stage_validation(
+        args,
+        stage="stage1",
+    )
+    print(report.format_text())
+    report.raise_for_errors()
+    output = ensure_separate_stage_output(
+        args.output_dir,
+        protected_files=(args.data, project.model_path, project.features_path),
+    )
+    selected, counts = select_stage_training_rows(
+        frame,
+        stage="stage1",
+        project=project,
+    )
+    predictors = _stage_core_matrix(selected, policy)
+    target = _finite_stage_target(selected, PUBLIC_REFERENCE_TARGET)
+    configured = stage_config(project, "stage1")
+    parameters = configured.get("xgb_parameters")
+    if not isinstance(parameters, Mapping):
+        raise ValueError("training_stages.stage1.xgb_parameters must be a mapping.")
+    seed, n_jobs = _stage_cpu_settings(project)
+    fitted = fit_fixed_model(
+        predictors,
+        target,
+        predictors=tuple(predictors.columns),
+        preprocessor_factory=_processor_factory(
+            policy,
+            project,
+            "core",
+            tuple(predictors.columns),
+            "xgboost",
+        ),
+        params=dict(parameters),
+        seed=seed,
+        n_jobs=n_jobs,
+        model_variant="stage1_public_base",
+        predictor_guard=LeakageGuard(policy, "core").validate,
+    )
+    _assert_stage_sources_unchanged(args.data, project, sources)
+    model_config_hash = str(sources["model_config_sha256"])
+    feature_hash = str(sources["feature_allowlist_sha256"])
+    input_schema = StageInputFeatureSchema.from_fitted_model(
+        fitted,
+        predictor_set="core",
+        policy=policy,
+        feature_allowlist_sha256=feature_hash,
+        model_config_sha256=model_config_hash,
+    )
+    input_hashes = {
+        "stage1_public_data_sha256": str(sources["data_sha256"]),
+        "model_config_sha256": model_config_hash,
+        "feature_allowlist_sha256": feature_hash,
+    }
+    completion = write_completed_stage_bundle(
+        output_dir=output,
+        stage="stage1_public_base",
+        project=project,
+        model=fitted,
+        input_schema=input_schema,
+        input_hashes=input_hashes,
+        run_metadata={
+            "command": "stage1-train",
+            "target_column": PUBLIC_REFERENCE_TARGET,
+            "target_provenance": str(configured["target_provenance"]),
+            "public_provenance_columns": list(STAGE1_PUBLIC_PROVENANCE_COLUMNS),
+            "training_rows": counts,
+            "predictor_set": "core",
+            "predictor_count": len(predictors.columns),
+            "sensor_columns_used_as_predictors": False,
+            "preprocessor_fit_scope": "stage1_eligible_rows_only",
+            "evaluation_performed": False,
+        },
+        model_config_snapshot=bytes(sources["model_config_snapshot"]),
+        feature_config_snapshot=bytes(sources["feature_config_snapshot"]),
+        before_completion_commit=lambda: _assert_stage_sources_unchanged(
+            args.data,
+            project,
+            sources,
+        ),
+    )
+    LOGGER.info(
+        "Completed immutable Stage 1 bundle at %s (manifest: %s)",
+        output,
+        completion,
+    )
+    return 0
+
+
+def _load_stage1_for_adaptation(
+    *,
+    root: Path,
+    project: ProjectConfig,
+    policy: FeaturePolicy,
+) -> Any:
+    bundle = load_completed_stage_bundle(
+        root,
+        policy=policy,
+        feature_allowlist_path=project.features_path,
+        allowed_stages=("stage1_public_base",),
+    )
+    _verify_stage_model_config(bundle, project)
+    return bundle
+
+
+def run_stage2_validate(args: Any) -> int:
+    """Validate local sensor adaptation data and its Stage 1 compatibility."""
+
+    project, policy, frame, report, _ = _stage_validation(args, stage="stage2")
+    print(report.format_text())
+    if not report.is_valid:
+        return 2
+    bundle = _load_stage1_for_adaptation(
+        root=args.stage1_dir,
+        project=project,
+        policy=policy,
+    )
+    selected, counts = select_stage_training_rows(
+        frame,
+        stage="stage2",
+        project=project,
+    )
+    predictors = _stage_core_matrix(
+        selected,
+        policy,
+        required_order=bundle.input_schema.raw_predictors,
+    )
+    # Transform-only is intentional: this also checks categorical compatibility
+    # while proving the frozen Stage 1 preprocessor is sufficient.
+    bundle.model.preprocessor.transform(predictors)
+    targets = derive_stage2_target_batch(selected, project=project)
+    targets.target_array()
+    LOGGER.info(
+        "Stage 2 validation ready: %d of %d rows have compatible online inputs "
+        "and freshly derived sensor UTCI targets",
+        counts["eligible_training_rows"],
+        counts["input_rows"],
+    )
+    return 0
+
+
+def run_stage2_adapt(args: Any) -> int:
+    """Continue boosting from Stage 1 using fresh sensor-derived UTCI targets."""
+
+    project, policy, frame, report, sources = _stage_validation(
+        args,
+        stage="stage2",
+    )
+    print(report.format_text())
+    report.raise_for_errors()
+    output = ensure_separate_stage_output(
+        args.output_dir,
+        stage1_dir=args.stage1_dir,
+        protected_files=(args.data, project.model_path, project.features_path),
+    )
+    bundle = _load_stage1_for_adaptation(
+        root=args.stage1_dir,
+        project=project,
+        policy=policy,
+    )
+    selected, counts = select_stage_training_rows(
+        frame,
+        stage="stage2",
+        project=project,
+    )
+    predictors = _stage_core_matrix(
+        selected,
+        policy,
+        required_order=bundle.input_schema.raw_predictors,
+    )
+    targets = derive_stage2_target_batch(selected, project=project)
+    target = targets.target_array()
+    configured = stage_config(project, "stage2")
+    adaptation = configured.get("adaptation")
+    if not isinstance(adaptation, Mapping):
+        raise ValueError("training_stages.stage2.adaptation must be a mapping.")
+    if str(adaptation.get("method")) != "continued_boosting":
+        raise ValueError(
+            "Stage 2 currently requires adaptation.method: continued_boosting."
+        )
+    lineage = parent_lineage_record(bundle)
+    parent_artifact_hashes_before = _stage_bundle_disk_hashes(bundle)
+    parent_model_reference = lineage["stage1_model"]
+    if not isinstance(parent_model_reference, Mapping):
+        raise ArtifactIntegrityError("Stage 1 lineage lacks a model reference.")
+    parent_model_path = bundle.root / str(parent_model_reference["path"])
+    parent_hash_before = sha256_file(parent_model_path)
+    seed, n_jobs = _stage_cpu_settings(project)
+    adapted = adapt_from_frozen_base(
+        bundle.model,
+        predictors,
+        target,
+        additional_trees=int(adaptation.get("additional_trees", 0)),
+        seed=seed,
+        n_jobs=n_jobs,
+        parameter_overrides=adaptation.get("parameter_overrides"),
+        predictor_guard=LeakageGuard(policy, "core").validate,
+    )
+    parent_artifact_hashes_after = _assert_stage_bundle_unchanged(
+        bundle,
+        parent_artifact_hashes_before,
+    )
+    parent_hash_after = sha256_file(parent_model_path)
+    lineage = {
+        **lineage,
+        "stage1_model_sha256_before_adaptation": parent_hash_before,
+        "stage1_model_sha256_after_adaptation": parent_hash_after,
+        "stage1_artifact_hashes_before_adaptation": parent_artifact_hashes_before,
+        "stage1_artifact_hashes_after_adaptation": parent_artifact_hashes_after,
+    }
+    _assert_stage_sources_unchanged(args.data, project, sources)
+    model_config_hash = str(sources["model_config_sha256"])
+    feature_hash = str(sources["feature_allowlist_sha256"])
+    input_hashes = {
+        "stage2_sensor_data_sha256": str(sources["data_sha256"]),
+        "model_config_sha256": model_config_hash,
+        "feature_allowlist_sha256": feature_hash,
+        "stage1_completion_manifest_sha256": str(
+            lineage["stage1_completion_manifest_sha256"]
+        ),
+        "stage1_model_sha256": parent_hash_before,
+        "stage1_preprocessor_sha256": str(
+            lineage["stage1_preprocessor"]["sha256"]
+        ),
+        "stage1_input_schema_sha256": str(
+            lineage["stage1_input_schema"]["sha256"]
+        ),
+    }
+
+    def assert_stage2_precommit() -> None:
+        _assert_stage_sources_unchanged(args.data, project, sources)
+        _assert_stage_bundle_unchanged(
+            bundle,
+            parent_artifact_hashes_before,
+        )
+
+    completion = write_completed_stage_bundle(
+        output_dir=output,
+        stage="stage2_local_adapted",
+        project=project,
+        model=adapted,
+        input_schema=bundle.input_schema,
+        input_hashes=input_hashes,
+        run_metadata={
+            "command": "stage2-adapt",
+            "target_column": TARGET,
+            "target_provenance": str(configured["target_provenance"]),
+            "raw_sensor_target_inputs": list(STAGE2_SENSOR_RAW_COLUMNS),
+            "sensor_provenance_columns": list(STAGE2_SENSOR_PROVENANCE_COLUMNS),
+            "sensor_columns_used_as_predictors": False,
+            "supplied_derived_targets_used_for_training": False,
+            "training_rows": counts,
+            "predictor_set": "core",
+            "predictor_count": len(predictors.columns),
+            "preprocessor_refit": False,
+            "base_tree_count": bundle.model.tree_count,
+            "additional_tree_count": int(adaptation["additional_trees"]),
+            "total_tree_count": adapted.tree_count,
+            "physical_target_configuration": {
+                "globe_mrt": configured.get("globe_mrt"),
+                "wind_profile": project.model.get("wind_profile"),
+                "utci_limits": project.model.get("utci", {}).get(
+                    "explicit_applicability_limits"
+                ),
+            },
+            "evaluation_performed": False,
+        },
+        parent_lineage=lineage,
+        model_config_snapshot=bytes(sources["model_config_snapshot"]),
+        feature_config_snapshot=bytes(sources["feature_config_snapshot"]),
+        before_completion_commit=assert_stage2_precommit,
+    )
+    LOGGER.info(
+        "Completed separate Stage 2 bundle at %s (manifest: %s); Stage 1 remains %s",
+        output,
+        completion,
+        bundle.root,
+    )
+    return 0
+
+
+def run_stage_predict(args: Any) -> int:
+    """Predict from either completed stage using online operational inputs only."""
+
+    output_suffix = args.output.suffix.lower()
+    if output_suffix not in {".csv", ".parquet", ".pq"}:
+        raise ValueError("--output must end in .csv or .parquet.")
+    project, policy, frame, report, sources = _stage_validation(
+        args,
+        stage="prediction",
+    )
+    print(report.format_text())
+    report.raise_for_errors()
+    bundle = load_completed_stage_bundle(
+        args.model_dir,
+        policy=policy,
+        feature_allowlist_path=project.features_path,
+    )
+    _verify_stage_model_config(bundle, project)
+    predictors = _stage_core_matrix(
+        frame,
+        policy,
+        required_order=bundle.input_schema.raw_predictors,
+    )
+    output = args.output.expanduser().resolve()
+    model_root = Path(args.model_dir).expanduser().resolve()
+    if output == model_root or output.is_relative_to(model_root):
+        raise ArtifactIntegrityError(
+            "Prediction output must not modify the completed model bundle."
+        )
+    _ensure_safe_destination(
+        output,
+        args.data,
+        project.model_path,
+        project.features_path,
+    )
+    _refuse_existing(output, "Stage prediction output")
+    prediction = bundle.model.predict(predictors)
+    if not np.isfinite(prediction).all():
+        raise ValueError(
+            "The staged model produced a non-finite UTCI prediction; no output was written."
+        )
+    result = pd.DataFrame(
+        {
+            "sample_id": frame["sample_id"].astype(str).to_numpy(),
+            "predicted_utci_c": prediction,
+            "predicted_utci_category": derive_utci_categories(prediction),
+            "model_stage": bundle.stage,
+        }
+    )
+    _assert_stage_sources_unchanged(args.data, project, sources)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output_suffix == ".csv":
+        result.to_csv(output, index=False)
+    else:
+        result.to_parquet(output, index=False)
+    LOGGER.info(
+        "Online-only predictions from %s written to %s",
+        bundle.stage,
+        output,
+    )
+    return 0
 
 
 def run_validate(args: Any) -> int:

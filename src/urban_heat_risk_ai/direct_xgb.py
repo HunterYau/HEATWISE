@@ -22,6 +22,20 @@ from xgboost import XGBRegressor
 
 LOGGER = logging.getLogger(__name__)
 
+ADAPTATION_OVERRIDE_KEYS = frozenset(
+    {
+        "learning_rate",
+        "max_depth",
+        "min_child_weight",
+        "subsample",
+        "colsample_bytree",
+        "reg_alpha",
+        "reg_lambda",
+        "gamma",
+        "huber_slope",
+    }
+)
+
 
 class TrainOnlyPreprocessor(Protocol):
     """Minimal preprocessing contract used by the model-selection code."""
@@ -89,7 +103,9 @@ class FittedDirectModel:
         missing = [name for name in self.predictors if name not in frame.columns]
         if missing:
             raise ValueError(f"Prediction table is missing predictors: {missing}")
-        transformed = self.preprocessor.transform(frame.loc[:, self.predictors])
+        transformed = self.preprocessor.transform(
+            frame.loc[:, list(self.predictors)]
+        )
         return np.asarray(self.model.predict(transformed), dtype=float)
 
 
@@ -522,4 +538,115 @@ def fit_fixed_model(
         objective=str(params.get("objective", "reg:absoluteerror")),
         tree_count=int(params["n_estimators"]),
         model_variant=(inferred_variant if weights is not None else model_variant),
+    )
+
+
+def validate_adaptation_overrides(overrides: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return safe continued-boosting overrides or reject structural changes."""
+
+    supplied = dict(overrides or {})
+    unsupported = sorted(set(supplied).difference(ADAPTATION_OVERRIDE_KEYS))
+    if unsupported:
+        raise ValueError(
+            "Stage 2 adaptation overrides may change only new-tree hyperparameters; "
+            f"unsupported keys: {unsupported}"
+        )
+    for name in ("learning_rate", "huber_slope"):
+        if name in supplied:
+            value = float(supplied[name])
+            if not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"Stage 2 {name} must be finite and positive.")
+    for name in ("min_child_weight", "reg_alpha", "reg_lambda", "gamma"):
+        if name in supplied:
+            value = float(supplied[name])
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    f"Stage 2 {name} must be finite and non-negative."
+                )
+    for name in ("subsample", "colsample_bytree"):
+        if name in supplied:
+            value = float(supplied[name])
+            if not math.isfinite(value) or not 0.0 < value <= 1.0:
+                raise ValueError(f"Stage 2 {name} must be finite and in (0, 1].")
+    if "max_depth" in supplied:
+        depth = supplied["max_depth"]
+        if isinstance(depth, bool) or int(depth) != depth or int(depth) <= 0:
+            raise ValueError("Stage 2 max_depth must be a positive integer.")
+    return supplied
+
+
+def adapt_from_frozen_base(
+    base: FittedDirectModel,
+    frame: pd.DataFrame,
+    target: Sequence[float],
+    *,
+    additional_trees: int,
+    seed: int,
+    n_jobs: int = 1,
+    parameter_overrides: Mapping[str, Any] | None = None,
+    predictor_guard: Callable[[Sequence[str]], Any] | None = None,
+) -> FittedDirectModel:
+    """Continue boosting from an immutable Stage 1 model.
+
+    The fitted Stage 1 preprocessor is transformed only and is never refit. A
+    copied booster initializes the new estimator, and the parent booster bytes
+    are checked before and after fitting so adaptation cannot silently mutate
+    the Stage 1 model in memory.
+    """
+
+    if additional_trees <= 0:
+        raise ValueError("Stage 2 additional_trees must be positive.")
+    if tuple(frame.columns) != tuple(base.predictors):
+        raise ValueError(
+            "Stage 2 predictors must exactly match the saved Stage 1 raw feature "
+            "order before adaptation."
+        )
+    if predictor_guard is not None:
+        predictor_guard(base.predictors)
+    y = np.asarray(target, dtype=float)
+    if len(frame) != len(y):
+        raise ValueError("Stage 2 predictor rows and target values have different lengths.")
+    if not np.isfinite(y).all():
+        raise ValueError("Stage 2 sensor-derived UTCI targets must all be finite.")
+
+    transformed = base.preprocessor.transform(
+        frame.loc[:, list(base.predictors)]
+    )
+    parent_booster = base.model.get_booster()
+    parent_before = bytes(parent_booster.save_raw(raw_format="ubj"))
+    parent_rounds = int(parent_booster.num_boosted_rounds())
+
+    params = {
+        key: value
+        for key, value in base.model.get_params(deep=False).items()
+        if value is not None
+    }
+    params.update(validate_adaptation_overrides(parameter_overrides))
+    params["objective"] = base.objective
+    params["n_estimators"] = int(additional_trees)
+    adapted = make_regressor(params, seed=seed, n_jobs=n_jobs)
+    adapted.fit(
+        transformed,
+        y,
+        xgb_model=parent_booster.copy(),
+        verbose=False,
+    )
+
+    parent_after = bytes(parent_booster.save_raw(raw_format="ubj"))
+    if parent_after != parent_before:
+        raise RuntimeError("Stage 1 booster changed during Stage 2 adaptation.")
+    total_rounds = int(adapted.get_booster().num_boosted_rounds())
+    expected_rounds = parent_rounds + int(additional_trees)
+    if total_rounds != expected_rounds:
+        raise RuntimeError(
+            "Unexpected continued-boosting tree count: "
+            f"expected {expected_rounds}, observed {total_rounds}."
+        )
+    return FittedDirectModel(
+        model=adapted,
+        preprocessor=base.preprocessor,
+        predictors=base.predictors,
+        objective=base.objective,
+        tree_count=total_rounds,
+        model_variant="stage2_local_adapted",
     )
